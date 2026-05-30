@@ -1,0 +1,22 @@
+# SFCW Radar System Configuration
+radar:
+  f_start: 1.0e9
+  f_stop:  4.0e9
+  bandwidth: 3.0e9
+  delta_f: 15.0e6
+  n_steps: 201
+  tx_power_dbm: -10
+
+pluto:
+  ip: "ip:192.168.2.1"
+  sample_rate: 2.5e6
+  rx_buffer_size: 1024
+
+processing:
+  n_background_scans: 10
+  respiration_band: [0.15, 0.40]
+  heartrate_band:   [1.00, 2.50]
+
+performance:
+  range_resolution_m: 0.05
+  max_range_m: 10.0

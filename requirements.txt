@@ -6,3 +6,4 @@ matplotlib>=3.7.0
 PyYAML>=6.0
 pyzmq>=25.0.0
 jupyter>=1.0.0
+pygame>=2.6.0

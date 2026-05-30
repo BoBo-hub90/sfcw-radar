@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Every 10 frames, save a PNG figure (range profile + spectrum) to data/.",
     )
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Show the live result on the fullscreen touchscreen display (pygame).",
+    )
     return parser.parse_args()
 
 
@@ -160,6 +165,13 @@ def main() -> None:
 
     sweep = SFCWSweep(device, switch_gpio_pin=SWITCH_GPIO_PIN)
 
+    # Optional touchscreen UI (pygame imported lazily so non-UI runs need no GUI).
+    display = None
+    if args.ui:
+        from ui.display import RadarDisplay  # noqa: E402
+        display = RadarDisplay()
+        display.start()
+
     # Range axis (meters) for plotting, derived once from the pipeline geometry.
     range_axis = np.arange(pipeline.n_steps) * pipeline.range_resolution_m
 
@@ -203,11 +215,20 @@ def main() -> None:
                 if args.plot and frame_index % PLOT_EVERY_N_FRAMES == 0:
                     save_plot(result, spectrum, range_axis, frame_index)
 
+            if display is not None:
+                display.update(result)
+                # Exit if the user pressed STOP on the touchscreen.
+                if not display.is_running():
+                    print("STOP pressed on display.")
+                    break
+
             frame_index += 1
 
     except KeyboardInterrupt:
         print()  # break the line after the ^C
     finally:
+        if display is not None:
+            display.stop()
         sweep.close()
         device.disconnect()
         print("Radar stopped.")

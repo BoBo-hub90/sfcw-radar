@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         help="Also estimate radial velocity / micro-Doppler at the target bin "
              "and print mean velocity and a moving/static flag.",
     )
+    parser.add_argument(
+        "--energy",
+        action="store_true",
+        help="Use the energy detector (current/background mean-power ratio) "
+             "alongside the CFAR pipeline and print the energy ratio.",
+    )
     return parser.parse_args()
 
 
@@ -217,6 +223,12 @@ def main() -> None:
     raw_buffer: deque[np.ndarray] = deque(maxlen=n_background)
     ref_buffer: deque[np.ndarray] = deque(maxlen=n_background)
 
+    # Static snapshot of the empty-scene warmup sweeps, used as the baseline
+    # for the energy detector (--energy). Captured once and never updated so a
+    # person entering later raises the current/background power ratio.
+    background_sweeps: list[np.ndarray] = []
+    background_matrix: np.ndarray | None = None
+
     try:
         # --- Warmup: fill the background buffer ---
         print(f"Warming up: capturing {n_warmup} background sweeps...")
@@ -224,6 +236,8 @@ def main() -> None:
             s_raw, s_ref = capture_sweep()
             raw_buffer.append(s_raw)
             ref_buffer.append(s_ref)
+            background_sweeps.append(s_raw)
+        background_matrix = np.asarray(background_sweeps)
         print("Warmup complete. Entering detection loop (Ctrl+C to stop).")
 
         # --- Continuous detection loop ---
@@ -250,6 +264,15 @@ def main() -> None:
                 line += (
                     f"  mean_velocity_ms={result['mean_velocity_ms']:+.3f}  "
                     f"moving={str(result['moving']):5s}"
+                )
+
+            # Energy detector runs alongside CFAR: compare the current sweeps'
+            # mean power against the empty-scene warmup baseline.
+            if args.energy:
+                energy = pipeline.energy_detect(S_raw, background_matrix)
+                line += (
+                    f"  energy_detected={str(energy['detected']):5s}  "
+                    f"energy_ratio={energy['energy_ratio']:.2f}"
                 )
             print(line)
 

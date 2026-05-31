@@ -94,6 +94,10 @@ class RadarPipeline:
             proc.get("peak_to_mean_threshold", 1.3)
         )
 
+        # Energy-detector threshold: the current/background mean-power ratio
+        # above which a target (e.g. a person entering the scene) is declared.
+        self.energy_threshold = float(proc.get("energy_threshold", 1.5))
+
         # CA-CFAR tuning from the optional `cfar` config section (falls back to
         # the module defaults when the section or a key is absent).
         cfar = self.config.get("cfar", {})
@@ -334,6 +338,65 @@ class RadarPipeline:
             "cfar_threshold": threshold,
             "range_profile": profile,
             "peak_to_mean": peak_to_mean,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Stage 4c — energy detector (CFAR alternative)
+    # ------------------------------------------------------------------ #
+
+    def energy_detect(
+        self, S_matrix: np.ndarray, background_matrix: np.ndarray
+    ) -> dict:
+        """
+        Coarse presence detector from total received energy vs a baseline.
+
+        Rather than localising a target in range (CFAR), this compares the mean
+        power of the current sweeps against the mean power of the empty-scene
+        warmup sweeps. A person entering the beam adds reflected energy, so the
+        ratio rises above 1; declaring detection when it exceeds
+        `energy_threshold` gives a robust yes/no even when no single range bin
+        stands out (the failure mode that defeats CFAR under heavy coupling).
+
+        Power is averaged over every element of each stack (all sweeps and all
+        LO steps), so the result is independent of how many sweeps each stack
+        holds.
+
+        Args:
+            S_matrix: Current sweeps, shape (n_sweeps, n_steps).
+            background_matrix: Empty-scene warmup sweeps, shape
+                (n_background_scans, n_steps).
+
+        Returns:
+            dict with keys:
+              detected            : bool, energy_ratio > energy_threshold.
+              energy_ratio        : float, current / background mean power.
+              current_energy_db   : float, 10*log10(current mean power).
+              background_energy_db : float, 10*log10(background mean power).
+        """
+        S_matrix = np.asarray(S_matrix)
+        background_matrix = np.asarray(background_matrix)
+
+        current_energy = float(np.mean(np.abs(S_matrix) ** 2))
+        background_energy = float(np.mean(np.abs(background_matrix) ** 2))
+
+        # Guard against an all-zero / empty background to avoid div-by-zero.
+        if background_energy > 0:
+            energy_ratio = current_energy / background_energy
+        else:
+            log.warning("energy_detect: background energy is zero; "
+                        "reporting ratio as inf")
+            energy_ratio = float("inf")
+
+        detected = bool(energy_ratio > self.energy_threshold)
+
+        current_energy_db = 10.0 * np.log10(current_energy + 1e-12)
+        background_energy_db = 10.0 * np.log10(background_energy + 1e-12)
+
+        return {
+            "detected": detected,
+            "energy_ratio": energy_ratio,
+            "current_energy_db": float(current_energy_db),
+            "background_energy_db": float(background_energy_db),
         }
 
     # ------------------------------------------------------------------ #

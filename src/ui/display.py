@@ -65,6 +65,14 @@ BAR_SALMON = (229, 115, 115)      # #e57373  (9-12 dB)
 BAR_RED = (192, 57, 43)           # #c0392b  (12-15 dB)
 BAR_DARK_RED = (139, 26, 26)      # #8b1a1a  (> 15 dB)
 
+# Detection chart accents: reference lines, alert bars, banner, peak marker.
+BASELINE_LINE = (26, 95, 168)     # #1a5fa8 blue empty-room baseline line/label
+THRESHOLD_LINE = (200, 40, 40)    # #c82828 red detection-threshold line/label
+BAR_ALERT_RED = (255, 0, 0)       # #ff0000 bars breaking the threshold (detected)
+BANNER_RGBA = (255, 0, 0, 110)    # semi-transparent red "TARGET DETECTED" banner
+PEAK_MARKER = (20, 20, 20)        # near-black peak triangle + distance label
+AXIS_TICK_COLOR = (70, 70, 70)    # darker than GREY_LABEL for tick numbers
+
 # --- Top bar (full-width control strip above the cards) ---
 TOP_BAR_H = 52
 TOP_BAR = pygame.Rect(0, 0, WIDTH, TOP_BAR_H)
@@ -143,6 +151,9 @@ class RadarDisplay:
         # Created inside the draw thread (pygame must init there).
         self._screen: pygame.Surface | None = None
         self._fonts: dict[str, pygame.font.Font] = {}
+        # Prefix for the detection banner; resolved to "⚠ " when the banner
+        # font actually carries the warning glyph, else a plain "! " fallback.
+        self._warn_prefix: str = "! "
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -242,7 +253,15 @@ class RadarDisplay:
                 "card_value": self._font(34, bold=True),
                 "card_sub": self._font(17),
                 "title": self._font(22, bold=True),
-                "axis": self._font(16),
+                # Tick numbers: slightly larger + darker than before so they
+                # read clearly on the touchscreen.
+                "axis": self._font(17),
+                # Axis titles ("SIGNAL (dB)" / "DISTANCE (meters)").
+                "axis_title": self._font(17, bold=True),
+                # Tiny labels for the baseline / threshold reference lines.
+                "chart_small": self._font(14),
+                # Peak distance callout above the tallest bar.
+                "peak": self._font(16, bold=True),
                 # Small status hint line (idle/connecting) — kept narrow so the
                 # longer idle prompt stays inside the card.
                 "hint": self._font(15),
@@ -251,7 +270,25 @@ class RadarDisplay:
                 "topbar_title": self._load_font(24, bold=True),
                 "button": self._load_font(22, bold=True),
                 "close": self._load_font(26, bold=True),
+                # Detection banner: DejaVu so the ⚠ warning glyph renders.
+                "banner": self._load_font(26, bold=True),
             }
+            # Use the ⚠ glyph only if the banner font truly renders it. metrics()
+            # is unreliable (it can report a width for a glyph the face draws as
+            # .notdef), so compare the rendered ⚠ against a guaranteed-missing
+            # codepoint: if they match, ⚠ is a tofu box and we fall back to "! ".
+            try:
+                bf = self._fonts["banner"]
+                warn = bf.render("⚠", True, WHITE)
+                miss = bf.render("", True, WHITE)  # PUA: unmapped -> .notdef
+                is_tofu = (
+                    warn.get_size() == miss.get_size()
+                    and pygame.image.tostring(warn, "RGBA")
+                    == pygame.image.tostring(miss, "RGBA")
+                )
+                self._warn_prefix = "! " if is_tofu else "⚠ "
+            except Exception:
+                pass
             clock = pygame.time.Clock()
 
             while self.is_running():
@@ -483,30 +520,38 @@ class RadarDisplay:
                         (rect.x + 12, rect.y + 80))
 
     def _draw_chart(self, result: dict | None, app_state: str) -> None:
-        """Bottom — live range-profile bar chart with dB grid and axes.
+        """Bottom — live range-profile bar chart with labeled axes.
 
-        The grid and axes always render; the bars are drawn only while running,
-        so the chart sits blank in the idle/connecting states.
+        The grid, tick labels and axis titles always render. The bars, the
+        baseline / detection-threshold reference lines, the peak marker and the
+        "TARGET DETECTED" banner are drawn only while running with data, so the
+        chart sits blank in the idle / connecting states.
         """
         self._blit_text("Live range profile", "title", BLACK,
                         (CHART.x + 4, CHART.y))
 
-        # Inner plotting area: room for the title, y labels, and x labels.
+        # Inner plotting area: room for the y-axis title + y labels on the left,
+        # and the x labels + x-axis title below.
         plot = pygame.Rect(
-            CHART.x + 45,
+            CHART.x + 48,
             CHART.y + 26,
-            CHART.w - 45 - 12,
-            CHART.h - 26 - 24,
+            CHART.w - 48 - 16,
+            176,
         )
+
+        def y_of_db(db: float) -> int:
+            """Map a dB value to a pixel row inside the plot (clipped 0..max)."""
+            db = max(0.0, min(Y_DB_MAX, db))
+            return plot.bottom - int(round((db / Y_DB_MAX) * plot.h))
 
         # Horizontal grid + Y tick labels (0..20 dB every 2.5).
         n_ticks = int(round(Y_DB_MAX / Y_TICK_STEP))
         for k in range(n_ticks + 1):
             db = k * Y_TICK_STEP
-            y = plot.bottom - int(round((db / Y_DB_MAX) * plot.h))
+            y = y_of_db(db)
             pygame.draw.line(self._screen, GRID_GREY,
                              (plot.x, y), (plot.right, y), 1)
-            label = self._fonts["axis"].render(f"{db:.1f}", True, GREY_LABEL)
+            label = self._fonts["axis"].render(f"{db:.1f}", True, AXIS_TICK_COLOR)
             self._screen.blit(
                 label, (plot.x - label.get_width() - 6, y - label.get_height() // 2)
             )
@@ -516,21 +561,23 @@ class RadarDisplay:
         for k in range(n_xticks + 1):
             m = k * X_TICK_STEP_M
             x = plot.x + int(round((m / X_RANGE_MAX_M) * plot.w))
-            label = self._fonts["axis"].render(f"{m:.1f}", True, GREY_LABEL)
+            label = self._fonts["axis"].render(f"{m:.1f}", True, AXIS_TICK_COLOR)
             self._screen.blit(label, (x - label.get_width() // 2, plot.bottom + 4))
 
-        # Vertical "dB" axis label on the far left, rotated 90 degrees.
-        db_label = self._fonts["axis"].render("dB", True, GREY_LABEL)
-        db_label = pygame.transform.rotate(db_label, 90)
+        # Axis titles: "SIGNAL (dB)" rotated up the left edge, "DISTANCE (meters)"
+        # centered below the x tick numbers.
+        y_title = self._fonts["axis_title"].render("SIGNAL (dB)", True, BLACK)
+        y_title = pygame.transform.rotate(y_title, 90)
         self._screen.blit(
-            db_label,
-            (CHART.x, plot.centery - db_label.get_height() // 2),
+            y_title, (CHART.x - 16, plot.centery - y_title.get_height() // 2)
+        )
+        x_title = self._fonts["axis_title"].render("DISTANCE (meters)", True, BLACK)
+        self._screen.blit(
+            x_title, (plot.centerx - x_title.get_width() // 2, plot.bottom + 24)
         )
 
-        # Bars: one per displayed range bin, colored by dB band. For a cleaner
-        # look the profile is downsampled to every 2nd bin (display only), bars
-        # are drawn narrower than their slot to leave gaps, and corners are
-        # slightly rounded. Only drawn while running (blank chart otherwise).
+        # --- Live data: bars, reference lines, banner, peak marker ----------
+        peak_marker = None  # (peak_x, apex_y, range_m)
         if app_state == "running" and result is not None:
             profile = np.asarray(result["range_profile"], dtype=float)
             # Downsample for display only (101 bars instead of 201).
@@ -540,41 +587,112 @@ class RadarDisplay:
                 profile_db = np.clip(
                     _amplitude_to_db(profile_disp), 0.0, Y_DB_MAX
                 )
+                detected = bool(result["detected"])
 
-                # Slot = full width / bars; bar fills 60% of it (40% gap).
+                # Detection threshold = empty-room baseline + margin. Only the
+                # app/level mode supplies a baseline; classic mode leaves it out.
+                baseline_db = result.get("baseline_db")
+                threshold_db = None
+                if baseline_db is not None:
+                    threshold_db = float(baseline_db) + float(
+                        result.get("detection_margin_db", 0.0)
+                    )
+
+                # Slot = full width / bars; normal bars fill 60% of it. Bars that
+                # break the threshold while detected are widened and bright red.
                 slot_w = plot.w / n_disp
                 bar_w = max(1, int(round(slot_w * 0.6)))
-                radius = min(2, bar_w // 2)
-
-                # Highlight the peak bar in green when a target is detected.
-                detected = bool(result["detected"])
-                peak_idx = int(np.argmax(profile_db)) if n_disp else -1
+                alert_w = min(int(round(slot_w)), bar_w + 4)
 
                 for i in range(n_disp):
                     db = float(profile_db[i])
                     h = int(round((db / Y_DB_MAX) * plot.h))
-                    # Center the bar within its slot to balance the gaps.
+                    is_alert = (
+                        detected and threshold_db is not None and db > threshold_db
+                    )
+                    w = alert_w if is_alert else bar_w
                     slot_left = plot.x + i * slot_w
-                    x0 = int(round(slot_left + (slot_w - bar_w) / 2))
-                    bar = pygame.Rect(x0, plot.bottom - h, bar_w, h)
-
-                    color = _bar_color(db)
-                    if detected and i == peak_idx:
-                        color = DARK_GREEN  # #2a6b2a peak highlight
+                    x0 = int(round(slot_left + (slot_w - w) / 2))
+                    bar = pygame.Rect(x0, plot.bottom - h, w, h)
+                    color = BAR_ALERT_RED if is_alert else _bar_color(db)
                     pygame.draw.rect(
-                        self._screen, color, bar, border_radius=radius
+                        self._screen, color, bar, border_radius=min(2, w // 2)
                     )
 
-        # Threshold reference line at 10 dB: a light-grey dashed horizontal line
-        # drawn over the bars (alternating filled/empty segments).
-        y_thr = plot.bottom - int(round((10.0 / Y_DB_MAX) * plot.h))
+                # Dramatic detection banner across the top of the plot.
+                banner_h = 30
+                if detected:
+                    banner = pygame.Surface((plot.w, banner_h), pygame.SRCALPHA)
+                    banner.fill(BANNER_RGBA)
+                    self._screen.blit(banner, (plot.x, plot.top))
+                    text = self._fonts["banner"].render(
+                        self._warn_prefix + "TARGET DETECTED", True, WHITE
+                    )
+                    self._screen.blit(
+                        text,
+                        (plot.centerx - text.get_width() // 2,
+                         plot.top + (banner_h - text.get_height()) // 2),
+                    )
+
+                # Baseline (blue) and detection-threshold (red) reference lines.
+                if baseline_db is not None:
+                    self._draw_ref_line(
+                        plot, y_of_db(float(baseline_db)), BASELINE_LINE,
+                        "baseline", below=True)
+                    self._draw_ref_line(
+                        plot, y_of_db(threshold_db), THRESHOLD_LINE,
+                        "detection threshold", below=False)
+
+                # Peak marker above the tallest bar (kept clear of the banner).
+                peak_idx = int(np.argmax(profile_db))
+                peak_x = int(round(plot.x + peak_idx * slot_w + slot_w / 2))
+                peak_h = int(round((float(profile_db[peak_idx]) / Y_DB_MAX) * plot.h))
+                apex_y = plot.bottom - peak_h - 3
+                min_apex_y = plot.top + (banner_h + 12 if detected else 12)
+                apex_y = max(apex_y, min_apex_y)
+                peak_range_m = (peak_x - plot.x) / plot.w * X_RANGE_MAX_M
+                peak_marker = (peak_x, apex_y, peak_range_m)
+
+        # Axes border last so it frames the bars and banner cleanly.
+        pygame.draw.rect(self._screen, BLACK, plot, BORDER_PX)
+
+        # Peak marker on top of the border: a downward triangle + distance.
+        if peak_marker is not None:
+            peak_x, apex_y, peak_range_m = peak_marker
+            pygame.draw.polygon(
+                self._screen, PEAK_MARKER,
+                [(peak_x - 6, apex_y - 10), (peak_x + 6, apex_y - 10),
+                 (peak_x, apex_y)],
+            )
+            label = self._fonts["peak"].render(
+                f"{peak_range_m:.1f} m", True, PEAK_MARKER
+            )
+            lx = peak_x + 9
+            if lx + label.get_width() > plot.right:
+                lx = peak_x - 9 - label.get_width()
+            ly = apex_y - 5 - label.get_height() // 2
+            self._blit_with_backing(label, (lx, ly))
+
+    def _draw_ref_line(self, plot: pygame.Rect, y: int, color, text: str,
+                       below: bool) -> None:
+        """Dashed horizontal reference line with a small right-edge label."""
         dash, gap = 6, 4
         x = plot.x
         while x < plot.right:
             x_end = min(x + dash, plot.right)
-            pygame.draw.line(self._screen, GREY_BORDER,
-                             (x, y_thr), (x_end, y_thr), 1)
+            pygame.draw.line(self._screen, color, (x, y), (x_end, y), 2)
             x += dash + gap
+        label = self._fonts["chart_small"].render(text, True, color)
+        lx = plot.right - 4 - label.get_width()
+        ly = (y + 3) if below else (y - 3 - label.get_height())
+        ly = max(plot.top + 1, min(ly, plot.bottom - label.get_height() - 1))
+        self._blit_with_backing(label, (lx, ly))
 
-        # Axes border last so it frames the bars cleanly.
-        pygame.draw.rect(self._screen, BLACK, plot, BORDER_PX)
+    def _blit_with_backing(self, surf: pygame.Surface, pos) -> None:
+        """Blit text over a translucent white pad so it stays legible on bars."""
+        bg = pygame.Surface(
+            (surf.get_width() + 6, surf.get_height() + 2), pygame.SRCALPHA
+        )
+        bg.fill((255, 255, 255, 205))
+        self._screen.blit(bg, (pos[0] - 3, pos[1] - 1))
+        self._screen.blit(surf, pos)

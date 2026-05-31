@@ -443,6 +443,10 @@ def _app_detection_loop(
         result["detected"] = level["detected"]
         result["signal_db"] = signal_db   # so the UI signal card matches
         result["range_profile"] = profile
+        # Pass the baseline and margin so the chart can draw the baseline and
+        # detection-threshold reference lines on the same dB scale as the bars.
+        result["baseline_db"] = baseline_db
+        result["detection_margin_db"] = pipeline.detection_margin_db
         display.update(result)
 
 

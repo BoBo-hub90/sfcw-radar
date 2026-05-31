@@ -138,8 +138,10 @@ class RadarDisplay:
         # Shared state, guarded by _lock.
         self._result: dict | None = None
         self._last_update_ts: float | None = None
-        # Timestamp when the current continuous detection started (None if idle).
-        self._detect_start_ts: float | None = None
+        # Wall-clock time when the current continuous detection began; None
+        # whenever no target is tracked. The Detection Time card shows elapsed
+        # seconds since this moment, never the raw timestamp.
+        self._detect_start: float | None = None
 
         # Kiosk state machine, guarded by _lock. The main thread sets _app_state
         # via set_app_state(); a START/STOP touch sets the matching request flag,
@@ -183,12 +185,14 @@ class RadarDisplay:
                 range_profile (np.ndarray), cfar_threshold (np.ndarray).
         """
         with self._lock:
-            prev_detected = bool(self._result["detected"]) if self._result else False
-            now_detected = bool(result["detected"])
-            if now_detected and not prev_detected:
-                self._detect_start_ts = time.time()  # rising edge
-            elif not now_detected:
-                self._detect_start_ts = None          # reset when idle
+            if bool(result["detected"]):
+                # Start the clock on the first detected frame and let it keep
+                # running for as long as the target stays continuously present.
+                if self._detect_start is None:
+                    self._detect_start = time.time()
+            else:
+                # Target lost: reset so the card snaps back to 0.0 s.
+                self._detect_start = None
 
             self._result = result
             self._last_update_ts = time.time()
@@ -219,7 +223,7 @@ class RadarDisplay:
             self._app_state = state
             if state != "running":
                 self._result = None
-                self._detect_start_ts = None
+                self._detect_start = None
 
     def consume_start_request(self) -> bool:
         """Return True once if START was pressed since the last call, then reset."""
@@ -368,7 +372,7 @@ class RadarDisplay:
     def _snapshot(self) -> tuple[dict | None, float | None, str]:
         """Return a consistent copy of the shared state under the lock."""
         with self._lock:
-            return self._result, self._detect_start_ts, self._app_state
+            return self._result, self._detect_start, self._app_state
 
     # ------------------------------------------------------------------ #
     # Rendering
@@ -480,7 +484,13 @@ class RadarDisplay:
             return
 
         detected = bool(result["detected"]) if result else False
-        elapsed = (time.time() - detect_start) if detect_start else 0.0
+        # Elapsed seconds since detection began — never the raw wall-clock time.
+        # Counts up while a target stays present, snaps to 0.0 the moment it is
+        # lost (detect_start is cleared by update() on the first clear frame).
+        if detected and detect_start is not None:
+            elapsed = time.time() - detect_start
+        else:
+            elapsed = 0.0
         sub_text = "active detection" if detected else "no active detection"
         self._blit_text(f"{elapsed:.1f} s", "card_value", BLACK,
                         (rect.x + 12, rect.y + 40))

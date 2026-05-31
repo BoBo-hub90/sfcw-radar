@@ -230,10 +230,27 @@ class RadarPipeline:
                                -1.0 if there is no detection.
               cfar_threshold : 1-D array (n_steps,), the adaptive threshold.
               range_profile  : 1-D array (n_steps,), the mean |h| profile.
+              peak_to_mean   : float, max(profile) / mean(profile), a coarse
+                               "how much does the peak stand out" measure.
         """
         h_matrix = np.atleast_2d(np.asarray(h_matrix))
         profile = np.abs(h_matrix).mean(axis=0)
         n = profile.size
+
+        # Peak-to-mean guard: a flat profile (every bin similar) carries no
+        # target, so skip CFAR entirely and report no detection. Only when the
+        # peak stands clearly above the average is the adaptive CFAR worthwhile.
+        mean_profile = float(np.mean(profile))
+        peak = float(np.max(profile))
+        peak_to_mean = peak / mean_profile if mean_profile > 0 else 0.0
+        if peak_to_mean <= 1.5:
+            return {
+                "detected": False,
+                "target_range_m": -1.0,
+                "cfar_threshold": np.full(n, np.inf),
+                "range_profile": profile,
+                "peak_to_mean": peak_to_mean,
+            }
 
         threshold = np.full(n, np.inf)
         guard = self.cfar_guard_cells
@@ -269,6 +286,7 @@ class RadarPipeline:
             "target_range_m": target_range_m,
             "cfar_threshold": threshold,
             "range_profile": profile,
+            "peak_to_mean": peak_to_mean,
         }
 
     # ------------------------------------------------------------------ #

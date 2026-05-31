@@ -21,9 +21,9 @@ processing:
   doppler_motion_threshold_ms: 0.05 # |mean velocity| above this = "moving"
 
 cfar:
-  guard_cells: 2
-  training_cells: 8
-  false_alarm_rate: 1e-2   # relaxed from 1e-3 to 1e-2
+  guard_cells: 4
+  training_cells: 16
+  false_alarm_rate: 0.1   # very relaxed for bring-up
 
 performance:
   range_resolution_m: 0.05

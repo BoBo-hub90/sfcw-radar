@@ -243,7 +243,8 @@ def main() -> None:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             line = (
                 f"[{timestamp}] detected={str(result['detected']):5s}  "
-                f"target_range_m={result['target_range_m']:.3f}"
+                f"target_range_m={result['target_range_m']:.3f}  "
+                f"peak_to_mean={result['peak_to_mean']:.2f}"
             )
             if args.doppler:
                 line += (

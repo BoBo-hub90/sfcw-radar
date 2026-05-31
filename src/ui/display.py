@@ -104,7 +104,8 @@ CHART = pygame.Rect(20, 150 + TOP_BAR_H, 760, 280 - TOP_BAR_H)  # 20,202,760,228
 Y_DB_MAX = 20.0          # Y axis spans 0..20 dB
 Y_TICK_STEP = 2.5        # label/grid every 2.5 dB
 SIGNAL_HISTORY_LEN = 100  # rolling time-history window: one bar per update()
-X_SAMPLE_TICK = 25       # x label every 25 samples (0, 25, 50, 75, 100)
+X_TIME_TICKS = 6         # max wall-clock (HH:MM:SS) tick labels on the X axis
+X_TICK_MIN_PX = 70       # min spacing between X tick labels so they never overlap
 
 # Border width approximating the spec's 1.5 px (pygame needs integer widths).
 BORDER_PX = 2
@@ -163,6 +164,10 @@ class RadarDisplay:
         # update() call. The chart draws this as a scrolling bar series
         # (oldest left, newest right). Bounded so memory stays flat.
         self._signal_history: deque[float] = deque(maxlen=SIGNAL_HISTORY_LEN)
+        # Parallel deque of wall-clock capture times (Pi system clock), one per
+        # sample in _signal_history and index-aligned with it. The chart reads
+        # these to label its X axis with real "HH:MM:SS" timestamps.
+        self._time_history: deque[datetime] = deque(maxlen=SIGNAL_HISTORY_LEN)
 
         # Kiosk state machine, guarded by _lock. The main thread sets _app_state
         # via set_app_state(); a START/STOP touch sets the matching request flag,
@@ -216,8 +221,10 @@ class RadarDisplay:
                 self._detect_start = None
 
             self._result = result
-            # Append this frame's peak signal level to the scrolling history.
+            # Append this frame's peak signal level and its capture time to the
+            # two parallel histories (kept index-aligned under the same lock).
             self._signal_history.append(_result_peak_db(result))
+            self._time_history.append(datetime.now())
             self._last_update_ts = time.time()
 
     def stop(self) -> None:
@@ -247,7 +254,9 @@ class RadarDisplay:
             if state != "running":
                 self._result = None
                 self._detect_start = None
-                self._signal_history.clear()  # next run starts from a blank chart
+                # Next run starts from a blank chart: clear both parallel histories.
+                self._signal_history.clear()
+                self._time_history.clear()
 
     def consume_start_request(self) -> bool:
         """Return True once if START was pressed since the last call, then reset."""
@@ -284,7 +293,7 @@ class RadarDisplay:
                 # Tick numbers: slightly larger + darker than before so they
                 # read clearly on the touchscreen.
                 "axis": self._font(17),
-                # Axis titles ("SIGNAL (dB)" / "TIME (samples)").
+                # Axis titles ("SIGNAL (dB)" / "TIME").
                 "axis_title": self._font(17, bold=True),
                 # Tiny labels for the threshold reference line.
                 "chart_small": self._font(14),
@@ -294,6 +303,8 @@ class RadarDisplay:
                 # Top-bar chrome uses DejaVu (falling back to the default font)
                 # so the ASCII labels render cleanly.
                 "topbar_title": self._load_font(24, bold=True),
+                # Live wall-clock readout in the top bar (HH:MM:SS).
+                "clock": self._load_font(22, bold=True),
                 "button": self._load_font(22, bold=True),
                 "close": self._load_font(26, bold=True),
                 # Detection banner: DejaVu so the ⚠ warning glyph renders.
@@ -319,8 +330,8 @@ class RadarDisplay:
 
             while self.is_running():
                 self._handle_events()
-                result, detect_start, app_state, history = self._snapshot()
-                self._draw(result, detect_start, app_state, history)
+                result, detect_start, app_state, history, times = self._snapshot()
+                self._draw(result, detect_start, app_state, history, times)
                 pygame.display.flip()
                 clock.tick(FPS)
         except Exception as e:  # keep the radar alive if the UI fails
@@ -391,11 +402,17 @@ class RadarDisplay:
                             self._stop_requested = True
                         # "connecting": button is inert, ignore the touch.
 
-    def _snapshot(self) -> tuple[dict | None, float | None, str, list[float]]:
-        """Return a consistent copy of the shared state under the lock."""
+    def _snapshot(
+        self,
+    ) -> tuple[dict | None, float | None, str, list[float], list[datetime]]:
+        """Return a consistent copy of the shared state under the lock.
+
+        The two histories are copied together so their indices stay aligned for
+        the draw thread (one timestamp per signal sample).
+        """
         with self._lock:
             return (self._result, self._detect_start, self._app_state,
-                    list(self._signal_history))
+                    list(self._signal_history), list(self._time_history))
 
     # ------------------------------------------------------------------ #
     # Rendering
@@ -403,14 +420,14 @@ class RadarDisplay:
 
     def _draw(
         self, result: dict | None, detect_start: float | None, app_state: str,
-        history: list[float],
+        history: list[float], times: list[datetime],
     ) -> None:
         """Render one full frame."""
         self._screen.fill(WHITE)
         self._draw_status_card(result, app_state)
         self._draw_time_card(result, detect_start, app_state)
         self._draw_signal_card(result, app_state)
-        self._draw_chart(result, app_state, history)
+        self._draw_chart(result, app_state, history, times)
         self._draw_top_bar(app_state)  # drawn last so it overlays everything
 
     def _blit_text(self, text, font_key, color, pos) -> None:
@@ -433,6 +450,17 @@ class RadarDisplay:
         title = self._fonts["topbar_title"].render("TWR RADAR", True, WHITE)
         self._screen.blit(
             title, (TITLE_PAD_X, (TOP_BAR_H - title.get_height()) // 2)
+        )
+
+        # Live wall-clock time from the Pi system clock (HH:MM:SS), white, just
+        # left of the START/STOP button and vertically centered. Re-rendered
+        # every frame so it ticks in real time.
+        clock_text = datetime.now().strftime("%H:%M:%S")
+        clock_surf = self._fonts["clock"].render(clock_text, True, WHITE)
+        self._screen.blit(
+            clock_surf,
+            (START_STOP_BTN.left - 16 - clock_surf.get_width(),
+             (TOP_BAR_H - clock_surf.get_height()) // 2),
         )
 
         # START/STOP button: fill and label follow the app state.
@@ -550,14 +578,16 @@ class RadarDisplay:
                         (rect.x + 12, rect.y + 80))
 
     def _draw_chart(self, result: dict | None, app_state: str,
-                    history: list[float]) -> None:
+                    history: list[float], times: list[datetime]) -> None:
         """Bottom — scrolling time-history of the peak signal level.
 
-        The grid, tick labels and axis titles always render. The time-sample
-        bars, the detection-threshold reference line and the "TARGET DETECTED"
-        banner are drawn only while running, so the chart sits blank in the
-        idle / connecting states. Each bar is one update() sample; the series
-        scrolls right-to-left with the newest sample on the right.
+        The grid and axis titles always render. The time-sample bars, the real
+        wall-clock X-axis ticks, the detection-threshold reference line and the
+        "TARGET DETECTED" banner are drawn only while running, so the chart sits
+        blank in the idle / connecting states. Each bar is one update() sample;
+        the series scrolls right-to-left with the newest sample on the right.
+        The X-axis ticks read the Pi system clock (HH:MM:SS) from the timestamp
+        captured alongside each bar, so the operator sees real capture times.
         """
         self._blit_text("Signal level over time", "title", BLACK,
                         (CHART.x + 4, CHART.y))
@@ -588,22 +618,43 @@ class RadarDisplay:
                 label, (plot.x - label.get_width() - 6, y - label.get_height() // 2)
             )
 
-        # X tick labels: sample index 0..100 every 25 (oldest left, newest right).
-        n_xticks = SIGNAL_HISTORY_LEN // X_SAMPLE_TICK
-        for k in range(n_xticks + 1):
-            s = k * X_SAMPLE_TICK
-            x = plot.x + int(round((s / SIGNAL_HISTORY_LEN) * plot.w))
-            label = self._fonts["axis"].render(f"{s}", True, AXIS_TICK_COLOR)
-            self._screen.blit(label, (x - label.get_width() // 2, plot.bottom + 4))
+        # Slot geometry: the X axis is SIGNAL_HISTORY_LEN equal slots with the
+        # newest sample on the right. Both the tick labels and the bars use it.
+        slot_w = plot.w / SIGNAL_HISTORY_LEN
 
-        # Axis titles: "SIGNAL (dB)" rotated up the left edge, "TIME (samples)"
-        # centered below the x tick numbers.
+        def slot_center_x(slot_index: int) -> int:
+            """Pixel X of the center of a given history slot."""
+            return plot.x + int(round((slot_index + 0.5) * slot_w))
+
+        # X tick labels: real wall-clock capture time (HH:MM:SS) sampled from
+        # the timestamps stored alongside the bars. Up to X_TIME_TICKS evenly
+        # spaced labels span the filled samples, the right-most being the newest.
+        # The count is capped by the filled width so labels never overlap.
+        n_t = len(times)
+        if n_t:
+            fit = max(1, int((n_t * slot_w) // X_TICK_MIN_PX))
+            n_labels = min(X_TIME_TICKS, n_t, fit)
+            for j in range(n_labels):
+                # Evenly spaced sample indices ending on the newest sample.
+                if n_labels == 1:
+                    idx = n_t - 1
+                else:
+                    idx = round(j * (n_t - 1) / (n_labels - 1))
+                slot_index = SIGNAL_HISTORY_LEN - n_t + idx  # newest -> rightmost
+                x = slot_center_x(slot_index)
+                stamp = times[idx].strftime("%H:%M:%S")
+                label = self._fonts["axis"].render(stamp, True, AXIS_TICK_COLOR)
+                self._screen.blit(
+                    label, (x - label.get_width() // 2, plot.bottom + 4))
+
+        # Axis titles: "SIGNAL (dB)" rotated up the left edge, "TIME" centered
+        # below the wall-clock x tick labels.
         y_title = self._fonts["axis_title"].render("SIGNAL (dB)", True, BLACK)
         y_title = pygame.transform.rotate(y_title, 90)
         self._screen.blit(
             y_title, (CHART.x - 16, plot.centery - y_title.get_height() // 2)
         )
-        x_title = self._fonts["axis_title"].render("TIME (samples)", True, BLACK)
+        x_title = self._fonts["axis_title"].render("TIME", True, BLACK)
         self._screen.blit(
             x_title, (plot.centerx - x_title.get_width() // 2, plot.bottom + 24)
         )
@@ -622,8 +673,8 @@ class RadarDisplay:
 
             # One slot per sample in the rolling window; the newest sample sits
             # at the right edge so the series scrolls right-to-left over time.
+            # slot_w is shared with the X-axis ticks computed above.
             n = len(history)
-            slot_w = plot.w / SIGNAL_HISTORY_LEN
             bar_w = max(1, int(round(slot_w * 0.7)))
             for k in range(n):
                 db = max(0.0, min(Y_DB_MAX, float(history[k])))

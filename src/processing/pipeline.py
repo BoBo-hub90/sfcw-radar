@@ -45,6 +45,18 @@ CFAR_GUARD_CELLS = 2
 CFAR_TRAINING_CELLS = 8
 CFAR_PFA = 1e-3
 
+# Number of near-range bins to exclude from detection. The first few bins are
+# dominated by TX->RX direct-coupling leakage (a strong, static return at ~0 m)
+# that would otherwise mask real targets; they are blanked before peak finding
+# and CFAR threshold crossing.
+NEAR_RANGE_EXCLUDE_BINS = 10
+
+# OS-CFAR order-statistic rank as a fraction of the training-cell count. The
+# training cells are sorted ascending and the value at this percentile is used
+# as the local noise estimate, which is robust when several cells contain
+# target energy (unlike the mean used by CA-CFAR).
+OS_CFAR_RANK_FRACTION = 0.75
+
 
 class RadarPipeline:
     """Processing chain from raw SFCW sweeps to a CFAR range detection."""
@@ -72,6 +84,14 @@ class RadarPipeline:
         self.sweep_period_s = float(proc.get("sweep_period_s", 1.5))
         self.doppler_motion_threshold_ms = float(
             proc.get("doppler_motion_threshold_ms", 0.05)
+        )
+
+        # Minimum peak-to-mean ratio of the range profile below which the scene
+        # is treated as flat (no target) and CFAR is skipped. Lowered for the
+        # direct-coupling-dominated bring-up case (a leaky front end pins the
+        # ratio near ~1.8 regardless of scene).
+        self.peak_to_mean_threshold = float(
+            proc.get("peak_to_mean_threshold", 1.3)
         )
 
         # CA-CFAR tuning from the optional `cfar` config section (falls back to
@@ -203,21 +223,32 @@ class RadarPipeline:
         self, h_matrix: np.ndarray, range_axis: np.ndarray
     ) -> dict:
         """
-        1-D Cell-Averaging CFAR along range on the mean magnitude profile.
+        1-D Order-Statistics CFAR (OS-CFAR) along range on the mean profile.
 
         The detector forms P(R) = mean_t |h(R, t)| and, for each cell under test
-        (CUT), estimates the local noise level from training cells on both sides
-        (separated from the CUT by guard cells). The adaptive threshold is
-        alpha * noise, where alpha = N * (Pfa^(-1/N) - 1) for N training cells,
-        the standard CA-CFAR factor for a target false-alarm rate.
+        (CUT), gathers training cells on both sides (separated from the CUT by
+        guard cells). Instead of averaging them (CA-CFAR), the training cells are
+        sorted and the value at the OS_CFAR_RANK_FRACTION percentile is taken as
+        the local noise estimate. This order-statistic is robust when several
+        training cells already contain target energy, which is exactly the
+        cluttered, direct-coupling-dominated case here. The adaptive threshold is
+        alpha * noise, with alpha = N * (Pfa^(-1/N) - 1) for N training cells.
+
+        Two extra guards are applied for the leaky bring-up front end:
+          - Peak-to-mean guard: if the whole profile is nearly flat
+            (peak / mean <= peak_to_mean_threshold) the scene carries no target,
+            so CFAR is skipped and no detection is reported.
+          - Near-range exclusion: the first NEAR_RANGE_EXCLUDE_BINS bins hold
+            TX->RX direct-coupling leakage and are removed from both peak finding
+            and threshold crossing.
 
         Edge cells with no available training window keep an infinite threshold
         (never detect). The threshold factor is computed from the number of
         training cells actually used, so the false-alarm rate stays consistent
         near the array edges.
 
-        Note: CA-CFAR theory assumes square-law (power) samples; here it is
-        applied to magnitude, the common practical approximation.
+        Note: CFAR theory assumes square-law (power) samples; here it is applied
+        to magnitude, the common practical approximation.
 
         Args:
             h_matrix: Range profiles, shape (n_sweeps, n_steps).
@@ -225,7 +256,7 @@ class RadarPipeline:
 
         Returns:
             dict with keys:
-              detected       : bool, True if any cell exceeds its threshold.
+              detected       : bool, True if any valid cell exceeds its threshold.
               target_range_m : float, range of the strongest detected cell, or
                                -1.0 if there is no detection.
               cfar_threshold : 1-D array (n_steps,), the adaptive threshold.
@@ -243,7 +274,7 @@ class RadarPipeline:
         mean_profile = float(np.mean(profile))
         peak = float(np.max(profile))
         peak_to_mean = peak / mean_profile if mean_profile > 0 else 0.0
-        if peak_to_mean <= 1.5:
+        if peak_to_mean <= self.peak_to_mean_threshold:
             return {
                 "detected": False,
                 "target_range_m": -1.0,
@@ -252,12 +283,21 @@ class RadarPipeline:
                 "peak_to_mean": peak_to_mean,
             }
 
+        # Near-range exclusion: blank the direct-coupling zone so only bins from
+        # NEAR_RANGE_EXCLUDE_BINS onward are eligible for detection.
+        valid_mask = np.zeros(n, dtype=bool)
+        valid_mask[NEAR_RANGE_EXCLUDE_BINS:] = True
+
         threshold = np.full(n, np.inf)
         guard = self.cfar_guard_cells
         train = self.cfar_training_cells
         pfa = self.cfar_pfa
 
         for i in range(n):
+            # Only compute a threshold for cells that are eligible to detect.
+            if not valid_mask[i]:
+                continue
+
             # Leading and lagging training windows, clipped to the array.
             lead = profile[max(0, i - guard - train): max(0, i - guard)]
             lag = profile[i + guard + 1: i + guard + 1 + train]
@@ -267,16 +307,23 @@ class RadarPipeline:
             if n_train == 0:
                 continue  # leave threshold at +inf -> no detection
 
-            noise = training.mean()
+            # OS-CFAR noise estimate: the order statistic at the configured
+            # rank. Sort ascending and index the percentile; clamp the rank to
+            # the cells actually available so edge windows stay in bounds.
+            sorted_training = np.sort(training)
+            k = min(int(OS_CFAR_RANK_FRACTION * train), n_train - 1)
+            noise = sorted_training[k]
+
             alpha = n_train * (pfa ** (-1.0 / n_train) - 1.0)
             threshold[i] = alpha * noise
 
-        detections = profile > threshold
+        # Threshold crossing, restricted to the valid (non-near-range) bins.
+        detections = (profile > threshold) & valid_mask
         if np.any(detections):
             det_idx = np.flatnonzero(detections)
-            peak = det_idx[np.argmax(profile[det_idx])]
+            peak_bin = det_idx[np.argmax(profile[det_idx])]
             detected = True
-            target_range_m = float(range_axis[peak])
+            target_range_m = float(range_axis[peak_bin])
         else:
             detected = False
             target_range_m = -1.0

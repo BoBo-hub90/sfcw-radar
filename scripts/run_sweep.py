@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show the live result on the fullscreen touchscreen display (pygame).",
     )
+    parser.add_argument(
+        "--no-ref",
+        action="store_true",
+        help="Run without the reference RF switch: capture the measurement path "
+             "only and skip phase correction (use when GPIO 17 has no switch).",
+    )
     return parser.parse_args()
 
 
@@ -175,15 +181,33 @@ def main() -> None:
     # Range axis (meters) for plotting, derived once from the pipeline geometry.
     range_axis = np.arange(pipeline.n_steps) * pipeline.range_resolution_m
 
+    # Reference-path handling. With a real RF switch each sweep yields both the
+    # measurement and reference paths and phase correction divides them out.
+    # Without the switch (--no-ref) we capture the measurement path only and
+    # substitute a flat reference of ones, so pipeline.run(S_raw, S_ref) is
+    # unchanged but the S_raw / S_ref division becomes a no-op.
+    fake_ref = np.ones(pipeline.n_steps, dtype=np.complex128)
+    if args.no_ref:
+        log.warning("Running without reference path — phase correction disabled")
+
+    def capture_sweep() -> tuple[np.ndarray, np.ndarray]:
+        """Capture one sweep, with or without the reference path."""
+        if args.no_ref:
+            return sweep.run_sweep(), fake_ref
+        return sweep.run_sweep_with_reference()
+
+    # Fewer warmup sweeps without the reference path for faster hardware testing.
+    n_warmup = 5 if args.no_ref else n_background
+
     # Rolling buffers of the most recent sweeps (clutter background window).
     raw_buffer: deque[np.ndarray] = deque(maxlen=n_background)
     ref_buffer: deque[np.ndarray] = deque(maxlen=n_background)
 
     try:
         # --- Warmup: fill the background buffer ---
-        print(f"Warming up: capturing {n_background} background sweeps...")
-        for _ in range(n_background):
-            s_raw, s_ref = sweep.run_sweep_with_reference()
+        print(f"Warming up: capturing {n_warmup} background sweeps...")
+        for _ in range(n_warmup):
+            s_raw, s_ref = capture_sweep()
             raw_buffer.append(s_raw)
             ref_buffer.append(s_ref)
         print("Warmup complete. Entering detection loop (Ctrl+C to stop).")
@@ -191,7 +215,7 @@ def main() -> None:
         # --- Continuous detection loop ---
         frame_index = 0
         while True:
-            s_raw, s_ref = sweep.run_sweep_with_reference()
+            s_raw, s_ref = capture_sweep()
             raw_buffer.append(s_raw)
             ref_buffer.append(s_ref)
 

@@ -44,14 +44,15 @@ Usage:
 
 from __future__ import annotations
 
-import logging
 import time
 
 import numpy as np
 import yaml
 import adi
 
-log = logging.getLogger(__name__)
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 # AD9361 LO channels on the ad9361-phy device. Both are output channels.
 TX_LO_CHANNEL = "altvoltage1"

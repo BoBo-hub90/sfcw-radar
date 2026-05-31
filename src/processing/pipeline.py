@@ -29,12 +29,12 @@ max_range_m.
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
 import yaml
 
-log = logging.getLogger(__name__)
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 # Speed of light (m/s).
 C = 299_792_458.0

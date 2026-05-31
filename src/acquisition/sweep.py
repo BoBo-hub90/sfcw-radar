@@ -44,14 +44,14 @@ Usage:
 
 from __future__ import annotations
 
-import logging
 import time
 
 import numpy as np
 
 from pluto.device import PlutoDevice
+from utils.logger import get_logger
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # Minimum buffer fills per step (dwell), per requirements.
 DEFAULT_DWELL_BUFFERS = 5

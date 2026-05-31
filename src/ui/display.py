@@ -24,7 +24,6 @@ Usage:
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from datetime import datetime
@@ -32,7 +31,9 @@ from datetime import datetime
 import numpy as np
 import pygame
 
-log = logging.getLogger(__name__)
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 WIDTH, HEIGHT = 800, 480
 FPS = 15  # modest refresh rate is plenty for a touchscreen

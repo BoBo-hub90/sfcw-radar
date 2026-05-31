@@ -332,21 +332,62 @@ class RadarDisplay:
             label = self._fonts["axis"].render(f"{m:.1f}", True, GREY_LABEL)
             self._screen.blit(label, (x - label.get_width() // 2, plot.bottom + 4))
 
-        # Bars: one per range bin, colored by dB band.
+        # Vertical "dB" axis label on the far left, rotated 90 degrees.
+        db_label = self._fonts["axis"].render("dB", True, GREY_LABEL)
+        db_label = pygame.transform.rotate(db_label, 90)
+        self._screen.blit(
+            db_label,
+            (CHART.x, plot.centery - db_label.get_height() // 2),
+        )
+
+        # Bars: one per displayed range bin, colored by dB band. For a cleaner
+        # look the profile is downsampled to every 2nd bin (display only), bars
+        # are drawn narrower than their slot to leave gaps, and corners are
+        # slightly rounded.
         if result is not None:
             profile = np.asarray(result["range_profile"], dtype=float)
-            n = profile.size
-            if n > 0:
-                profile_db = np.clip(_amplitude_to_db(profile), 0.0, Y_DB_MAX)
-                bar_w = plot.w / n
-                for i in range(n):
+            # Downsample for display only (101 bars instead of 201).
+            profile_disp = profile[::2]
+            n_disp = profile_disp.size
+            if n_disp > 0:
+                profile_db = np.clip(
+                    _amplitude_to_db(profile_disp), 0.0, Y_DB_MAX
+                )
+
+                # Slot = full width / bars; bar fills 60% of it (40% gap).
+                slot_w = plot.w / n_disp
+                bar_w = max(1, int(round(slot_w * 0.6)))
+                radius = min(2, bar_w // 2)
+
+                # Highlight the peak bar in green when a target is detected.
+                detected = bool(result["detected"])
+                peak_idx = int(np.argmax(profile_db)) if n_disp else -1
+
+                for i in range(n_disp):
                     db = float(profile_db[i])
                     h = int(round((db / Y_DB_MAX) * plot.h))
-                    x0 = plot.x + int(round(i * bar_w))
-                    x1 = plot.x + int(round((i + 1) * bar_w))
-                    w = max(1, x1 - x0)
-                    bar = pygame.Rect(x0, plot.bottom - h, w, h)
-                    pygame.draw.rect(self._screen, _bar_color(db), bar)
+                    # Center the bar within its slot to balance the gaps.
+                    slot_left = plot.x + i * slot_w
+                    x0 = int(round(slot_left + (slot_w - bar_w) / 2))
+                    bar = pygame.Rect(x0, plot.bottom - h, bar_w, h)
+
+                    color = _bar_color(db)
+                    if detected and i == peak_idx:
+                        color = DARK_GREEN  # #2a6b2a peak highlight
+                    pygame.draw.rect(
+                        self._screen, color, bar, border_radius=radius
+                    )
+
+        # Threshold reference line at 10 dB: a light-grey dashed horizontal line
+        # drawn over the bars (alternating filled/empty segments).
+        y_thr = plot.bottom - int(round((10.0 / Y_DB_MAX) * plot.h))
+        dash, gap = 6, 4
+        x = plot.x
+        while x < plot.right:
+            x_end = min(x + dash, plot.right)
+            pygame.draw.line(self._screen, GREY_BORDER,
+                             (x, y_thr), (x_end, y_thr), 1)
+            x += dash + gap
 
         # Axes border last so it frames the bars cleanly.
         pygame.draw.rect(self._screen, BLACK, plot, BORDER_PX)

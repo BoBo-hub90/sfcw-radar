@@ -5,13 +5,16 @@ radar:
   bandwidth: 3.0e9
   delta_f: 15.0e6
   n_steps: 201
-  tx_power_dbm: -10
+  tx_power_dbm: 0      # was -10, raise to 0 dBm (Pluto maximum)
+                       # to boost the weak return signal
 
 pluto:
   ip: "ip:192.168.2.1"
   sample_rate: 2.5e6
   rx_buffer_size: 1024
-  rx_gain_db: 20     # lowered from 40 to avoid ADC saturation
+  rx_gain_db: 70       # was 20, raise to 70 dB (AD9363 near-maximum)
+                       # since the signal is far below ADC full scale
+                       # with no saturation risk
   dwell_buffers: 1   # buffers averaged per LO step (1 = fastest sweep)
 
 processing:

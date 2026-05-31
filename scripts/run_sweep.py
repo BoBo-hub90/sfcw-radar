@@ -26,6 +26,7 @@ to data/ as .npy files for offline inspection.
 Usage:
     python scripts/run_sweep.py
     python scripts/run_sweep.py --debug
+    python scripts/run_sweep.py --app      # touchscreen kiosk (START/STOP/CLOSE)
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from collections import deque
 from datetime import datetime
 
@@ -107,6 +109,14 @@ def parse_args() -> argparse.Namespace:
         help="Use the signal-level detector: compare the current peak range-"
              "profile dB against the empty-room baseline captured at warmup. "
              "Its verdict becomes the primary 'detected' result feeding the UI.",
+    )
+    parser.add_argument(
+        "--app",
+        action="store_true",
+        help="Touchscreen kiosk mode: open the UI idle and wait for a START "
+             "touch, run until STOP, and close on the red X. Implies "
+             "--ui --no-ref --no-bg --level. Intended for the Raspberry Pi "
+             "desktop icon (no keyboard required).",
     )
     return parser.parse_args()
 
@@ -205,14 +215,8 @@ def save_plot(
     plt.close(fig)
 
 
-def main() -> None:
-    """Set up the radar and run the live detection loop until Ctrl+C."""
-    args = parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-
+def run_classic_mode(args: argparse.Namespace) -> None:
+    """Original flow: connect, warm up, then loop until Ctrl+C (or UI STOP)."""
     # --- Instantiate the three stages ---
     device = PlutoDevice(CONFIG_PATH)
     pipeline = RadarPipeline(CONFIG_PATH)
@@ -377,6 +381,150 @@ def main() -> None:
         sweep.close()
         device.disconnect()
         print("Radar stopped.")
+
+
+# ----------------------------------------------------------------------- #
+# Kiosk app mode (--app): touchscreen state machine
+# ----------------------------------------------------------------------- #
+
+# Empty-room warmup sweeps captured (to build the level baseline) on each START.
+APP_WARMUP_SWEEPS = 5
+
+
+def _app_warmup_baseline(
+    pipeline: RadarPipeline, sweep: SFCWSweep, display
+) -> float:
+    """
+    Capture APP_WARMUP_SWEEPS empty-room sweeps and return the level baseline.
+
+    Mirrors the --level warmup in classic mode: average the no-background range-
+    profile peak dB across the warmup sweeps. Aborts early (returning whatever
+    was gathered) if the app is closed mid-warmup.
+
+    Args:
+        pipeline: The configured RadarPipeline.
+        sweep: A ready SFCWSweep bound to the connected device.
+        display: The RadarDisplay (so a CLOSE during warmup stops the capture).
+
+    Returns:
+        The mean empty-room peak dB, or 0.0 if no sweep was captured.
+    """
+    peak_dbs: list[float] = []
+    for _ in range(APP_WARMUP_SWEEPS):
+        if not display.is_running():
+            break
+        s_raw = sweep.run_sweep()
+        s_ref = np.ones(len(s_raw), dtype=np.complex128)
+        _, peak_db = level_range_profile(pipeline, s_raw, s_ref)
+        peak_dbs.append(peak_db)
+    baseline_db = float(np.mean(peak_dbs)) if peak_dbs else 0.0
+    print(f"Level baseline (empty room): {baseline_db:.2f} dB")
+    return baseline_db
+
+
+def _app_detection_loop(
+    pipeline: RadarPipeline, sweep: SFCWSweep, display, baseline_db: float
+) -> None:
+    """
+    Run level detection until STOP is touched or the app is closed.
+
+    Each iteration captures one measurement-path sweep and runs the no-background
+    pipeline for a full result dict, then overrides the verdict and the chart
+    profile with the signal-level detector's output so the UI shows exactly what
+    was compared against the baseline.
+    """
+    while display.is_running() and not display.consume_stop_request():
+        s_raw = sweep.run_sweep()
+        s_ref = np.ones(len(s_raw), dtype=np.complex128)
+        result = pipeline.run_no_bg(s_raw, s_ref)
+
+        profile, signal_db = level_range_profile(pipeline, s_raw, s_ref)
+        level = pipeline.level_detect(signal_db, baseline_db)
+        result["detected"] = level["detected"]
+        result["signal_db"] = signal_db   # so the UI signal card matches
+        result["range_profile"] = profile
+        display.update(result)
+
+
+def run_app_mode(args: argparse.Namespace) -> None:
+    """
+    Touchscreen kiosk state machine: idle -> connecting -> running -> idle.
+
+    The UI opens immediately and sits idle until START is touched. On START the
+    Pluto is connected, configured and warmed up (level baseline), then the
+    detection loop runs until STOP is touched. The red X closes the whole app.
+    The radio is connected only while a run is active and is torn down on STOP,
+    on close, or on any hardware error (which drops back to idle).
+    """
+    from ui.display import RadarDisplay  # lazy import: only --app needs pygame
+
+    pipeline = RadarPipeline(CONFIG_PATH)
+    display = RadarDisplay()
+    display.start()
+    display.set_app_state("idle")
+
+    device: PlutoDevice | None = None
+    sweep: SFCWSweep | None = None
+    try:
+        while display.is_running():          # until the red X closes the app
+            if not display.consume_start_request():
+                time.sleep(0.05)             # idle — wait without busy-spinning
+                continue
+
+            try:
+                # --- Connect & warm up ---
+                display.set_app_state("connecting")
+                device = PlutoDevice(CONFIG_PATH)
+                device.connect()
+                device.configure()
+                device.store_fastlock_profiles(device.frequency_vector())
+                sweep = SFCWSweep(device, switch_gpio_pin=SWITCH_GPIO_PIN)
+                baseline_db = _app_warmup_baseline(pipeline, sweep, display)
+
+                # --- Run until STOP / close ---
+                if display.is_running():
+                    display.set_app_state("running")
+                    _app_detection_loop(pipeline, sweep, display, baseline_db)
+            except Exception as e:
+                # A hardware failure drops back to idle rather than crashing.
+                log.error("Radar run failed: %s", e)
+            finally:
+                # Tear down the radio whenever a run ends (STOP, close, error).
+                if sweep is not None:
+                    sweep.close()
+                    sweep = None
+                if device is not None:
+                    device.stop_cw()
+                    device.disconnect()
+                    device = None
+                if display.is_running():
+                    display.set_app_state("idle")
+    finally:
+        if sweep is not None:
+            sweep.close()
+        if device is not None:
+            device.disconnect()
+        display.stop()
+        print("Radar stopped.")
+
+
+def main() -> None:
+    """Parse arguments, configure logging, and dispatch to the chosen run mode."""
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    if args.app:
+        # --app is the kiosk preset and implies these flags.
+        args.ui = True
+        args.no_ref = True
+        args.no_bg = True
+        args.level = True
+        run_app_mode(args)
+    else:
+        run_classic_mode(args)
 
 
 if __name__ == "__main__":

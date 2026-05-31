@@ -298,3 +298,23 @@ class RadarPipeline:
         S_clean = self.background_subtraction(S_corrected)
         h_matrix, range_axis = self.range_profile(S_clean)
         return self.cfar_detect(h_matrix, range_axis)
+
+    def run_no_bg(self, S_raw: np.ndarray, S_ref: np.ndarray) -> dict:
+        """
+        Run the chain without background subtraction.
+
+        Identical to run() but the static-clutter removal stage is skipped:
+        phase_correction -> range_profile -> cfar_detect. Useful when there is
+        no stable clutter background to estimate (e.g. very few sweeps, or a
+        single moving setup) and the subtraction would otherwise remove signal.
+
+        Args:
+            S_raw: Measurement-path sweep stack, shape (n_sweeps, n_steps).
+            S_ref: Reference-path sweep stack, same shape.
+
+        Returns:
+            The detection dict from cfar_detect().
+        """
+        S_corrected = self.phase_correction(S_raw, S_ref)
+        h_matrix, range_axis = self.range_profile(S_corrected)
+        return self.cfar_detect(h_matrix, range_axis)

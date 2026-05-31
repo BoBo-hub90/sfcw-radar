@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         help="Run without the reference RF switch: capture the measurement path "
              "only and skip phase correction (use when GPIO 17 has no switch).",
     )
+    parser.add_argument(
+        "--no-bg",
+        action="store_true",
+        help="Skip background subtraction (phase_correction -> range_profile -> "
+             "cfar_detect) when there is no stable clutter background to estimate.",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +195,8 @@ def main() -> None:
     fake_ref = np.ones(pipeline.n_steps, dtype=np.complex128)
     if args.no_ref:
         log.warning("Running without reference path — phase correction disabled")
+    if args.no_bg:
+        log.warning("Background subtraction disabled")
 
     def capture_sweep() -> tuple[np.ndarray, np.ndarray]:
         """Capture one sweep, with or without the reference path."""
@@ -221,7 +229,10 @@ def main() -> None:
 
             S_raw = np.asarray(raw_buffer)
             S_ref = np.asarray(ref_buffer)
-            result = pipeline.run(S_raw, S_ref)
+            if args.no_bg:
+                result = pipeline.run_no_bg(S_raw, S_ref)
+            else:
+                result = pipeline.run(S_raw, S_ref)
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(

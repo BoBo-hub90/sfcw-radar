@@ -13,7 +13,7 @@ Layout (800x480, white background):
   - Top bar: dark control strip with the "TWR RADAR" title, a START/STOP
              button (state-colored) and a red CLOSE button
   - Cards:   three stat cards (Detection Status, Detection Time, Signal)
-  - Bottom:  a live range-profile bar chart in dB
+  - Bottom:  a scrolling time-history bar chart of the signal level in dB
 
 The kiosk app drives this via a small state machine: set_app_state() switches
 between "idle", "connecting" and "running", while START/STOP touches are picked
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -65,12 +66,10 @@ BAR_SALMON = (229, 115, 115)      # #e57373  (9-12 dB)
 BAR_RED = (192, 57, 43)           # #c0392b  (12-15 dB)
 BAR_DARK_RED = (139, 26, 26)      # #8b1a1a  (> 15 dB)
 
-# Detection chart accents: reference lines, alert bars, banner, peak marker.
-BASELINE_LINE = (26, 95, 168)     # #1a5fa8 blue empty-room baseline line/label
+# Detection chart accents: threshold line, alert bars, banner.
 THRESHOLD_LINE = (200, 40, 40)    # #c82828 red detection-threshold line/label
-BAR_ALERT_RED = (255, 0, 0)       # #ff0000 bars breaking the threshold (detected)
+BAR_ALERT_RED = (255, 0, 0)       # #ff0000 time samples breaking the threshold
 BANNER_RGBA = (255, 0, 0, 110)    # semi-transparent red "TARGET DETECTED" banner
-PEAK_MARKER = (20, 20, 20)        # near-black peak triangle + distance label
 AXIS_TICK_COLOR = (70, 70, 70)    # darker than GREY_LABEL for tick numbers
 
 # --- Top bar (full-width control strip above the cards) ---
@@ -104,8 +103,8 @@ CARD_X = [20, 20 + CARD_W + CARD_GAP, 20 + 2 * (CARD_W + CARD_GAP)]  # 20,280,54
 CHART = pygame.Rect(20, 150 + TOP_BAR_H, 760, 280 - TOP_BAR_H)  # 20,202,760,228
 Y_DB_MAX = 20.0          # Y axis spans 0..20 dB
 Y_TICK_STEP = 2.5        # label/grid every 2.5 dB
-X_RANGE_MAX_M = 10.0     # X axis spans 0..10 m
-X_TICK_STEP_M = 2.5      # label every 2.5 m
+SIGNAL_HISTORY_LEN = 100  # rolling time-history window: one bar per update()
+X_SAMPLE_TICK = 25       # x label every 25 samples (0, 25, 50, 75, 100)
 
 # Border width approximating the spec's 1.5 px (pygame needs integer widths).
 BORDER_PX = 2
@@ -127,6 +126,24 @@ def _bar_color(db: float):
     return BAR_DARK_RED
 
 
+def _result_peak_db(result: dict | None) -> float:
+    """Peak signal level (dB) for one result.
+
+    Prefers the level detector's ``signal_db`` (app/level mode) and falls back
+    to the range-profile peak otherwise, so the SIGNAL card and the time-history
+    chart always report the same value.
+    """
+    if result is None:
+        return 0.0
+    sig = result.get("signal_db")
+    if sig is not None:
+        return float(sig)
+    profile = np.asarray(result.get("range_profile", []), dtype=float)
+    if profile.size:
+        return float(_amplitude_to_db(np.max(profile)))
+    return 0.0
+
+
 class RadarDisplay:
     """Fullscreen pygame UI (white card theme) for live SFCW results."""
 
@@ -142,6 +159,10 @@ class RadarDisplay:
         # whenever no target is tracked. The Detection Time card shows elapsed
         # seconds since this moment, never the raw timestamp.
         self._detect_start: float | None = None
+        # Rolling time history of the peak signal level (dB), one entry per
+        # update() call. The chart draws this as a scrolling bar series
+        # (oldest left, newest right). Bounded so memory stays flat.
+        self._signal_history: deque[float] = deque(maxlen=SIGNAL_HISTORY_LEN)
 
         # Kiosk state machine, guarded by _lock. The main thread sets _app_state
         # via set_app_state(); a START/STOP touch sets the matching request flag,
@@ -195,6 +216,8 @@ class RadarDisplay:
                 self._detect_start = None
 
             self._result = result
+            # Append this frame's peak signal level to the scrolling history.
+            self._signal_history.append(_result_peak_db(result))
             self._last_update_ts = time.time()
 
     def stop(self) -> None:
@@ -224,6 +247,7 @@ class RadarDisplay:
             if state != "running":
                 self._result = None
                 self._detect_start = None
+                self._signal_history.clear()  # next run starts from a blank chart
 
     def consume_start_request(self) -> bool:
         """Return True once if START was pressed since the last call, then reset."""
@@ -260,12 +284,10 @@ class RadarDisplay:
                 # Tick numbers: slightly larger + darker than before so they
                 # read clearly on the touchscreen.
                 "axis": self._font(17),
-                # Axis titles ("SIGNAL (dB)" / "DISTANCE (meters)").
+                # Axis titles ("SIGNAL (dB)" / "TIME (samples)").
                 "axis_title": self._font(17, bold=True),
-                # Tiny labels for the baseline / threshold reference lines.
+                # Tiny labels for the threshold reference line.
                 "chart_small": self._font(14),
-                # Peak distance callout above the tallest bar.
-                "peak": self._font(16, bold=True),
                 # Small status hint line (idle/connecting) — kept narrow so the
                 # longer idle prompt stays inside the card.
                 "hint": self._font(15),
@@ -297,8 +319,8 @@ class RadarDisplay:
 
             while self.is_running():
                 self._handle_events()
-                result, detect_start, app_state = self._snapshot()
-                self._draw(result, detect_start, app_state)
+                result, detect_start, app_state, history = self._snapshot()
+                self._draw(result, detect_start, app_state, history)
                 pygame.display.flip()
                 clock.tick(FPS)
         except Exception as e:  # keep the radar alive if the UI fails
@@ -369,24 +391,26 @@ class RadarDisplay:
                             self._stop_requested = True
                         # "connecting": button is inert, ignore the touch.
 
-    def _snapshot(self) -> tuple[dict | None, float | None, str]:
+    def _snapshot(self) -> tuple[dict | None, float | None, str, list[float]]:
         """Return a consistent copy of the shared state under the lock."""
         with self._lock:
-            return self._result, self._detect_start, self._app_state
+            return (self._result, self._detect_start, self._app_state,
+                    list(self._signal_history))
 
     # ------------------------------------------------------------------ #
     # Rendering
     # ------------------------------------------------------------------ #
 
     def _draw(
-        self, result: dict | None, detect_start: float | None, app_state: str
+        self, result: dict | None, detect_start: float | None, app_state: str,
+        history: list[float],
     ) -> None:
         """Render one full frame."""
         self._screen.fill(WHITE)
         self._draw_status_card(result, app_state)
         self._draw_time_card(result, detect_start, app_state)
         self._draw_signal_card(result, app_state)
-        self._draw_chart(result, app_state)
+        self._draw_chart(result, app_state, history)
         self._draw_top_bar(app_state)  # drawn last so it overlays everything
 
     def _blit_text(self, text, font_key, color, pos) -> None:
@@ -511,11 +535,7 @@ class RadarDisplay:
                             (rect.x + 12, rect.y + 80))
             return
 
-        peak_db = 0.0
-        if result is not None:
-            profile = np.asarray(result["range_profile"], dtype=float)
-            if profile.size:
-                peak_db = float(_amplitude_to_db(np.max(profile)))
+        peak_db = _result_peak_db(result)
 
         if peak_db >= 12.0:
             confidence = "High"
@@ -529,15 +549,17 @@ class RadarDisplay:
         self._blit_text(f"Confidence: {confidence}", "card_sub", BLUE,
                         (rect.x + 12, rect.y + 80))
 
-    def _draw_chart(self, result: dict | None, app_state: str) -> None:
-        """Bottom — live range-profile bar chart with labeled axes.
+    def _draw_chart(self, result: dict | None, app_state: str,
+                    history: list[float]) -> None:
+        """Bottom — scrolling time-history of the peak signal level.
 
-        The grid, tick labels and axis titles always render. The bars, the
-        baseline / detection-threshold reference lines, the peak marker and the
-        "TARGET DETECTED" banner are drawn only while running with data, so the
-        chart sits blank in the idle / connecting states.
+        The grid, tick labels and axis titles always render. The time-sample
+        bars, the detection-threshold reference line and the "TARGET DETECTED"
+        banner are drawn only while running, so the chart sits blank in the
+        idle / connecting states. Each bar is one update() sample; the series
+        scrolls right-to-left with the newest sample on the right.
         """
-        self._blit_text("Live range profile", "title", BLACK,
+        self._blit_text("Signal level over time", "title", BLACK,
                         (CHART.x + 4, CHART.y))
 
         # Inner plotting area: room for the y-axis title + y labels on the left,
@@ -566,122 +588,82 @@ class RadarDisplay:
                 label, (plot.x - label.get_width() - 6, y - label.get_height() // 2)
             )
 
-        # X tick labels (0..10 m every 2.5).
-        n_xticks = int(round(X_RANGE_MAX_M / X_TICK_STEP_M))
+        # X tick labels: sample index 0..100 every 25 (oldest left, newest right).
+        n_xticks = SIGNAL_HISTORY_LEN // X_SAMPLE_TICK
         for k in range(n_xticks + 1):
-            m = k * X_TICK_STEP_M
-            x = plot.x + int(round((m / X_RANGE_MAX_M) * plot.w))
-            label = self._fonts["axis"].render(f"{m:.1f}", True, AXIS_TICK_COLOR)
+            s = k * X_SAMPLE_TICK
+            x = plot.x + int(round((s / SIGNAL_HISTORY_LEN) * plot.w))
+            label = self._fonts["axis"].render(f"{s}", True, AXIS_TICK_COLOR)
             self._screen.blit(label, (x - label.get_width() // 2, plot.bottom + 4))
 
-        # Axis titles: "SIGNAL (dB)" rotated up the left edge, "DISTANCE (meters)"
+        # Axis titles: "SIGNAL (dB)" rotated up the left edge, "TIME (samples)"
         # centered below the x tick numbers.
         y_title = self._fonts["axis_title"].render("SIGNAL (dB)", True, BLACK)
         y_title = pygame.transform.rotate(y_title, 90)
         self._screen.blit(
             y_title, (CHART.x - 16, plot.centery - y_title.get_height() // 2)
         )
-        x_title = self._fonts["axis_title"].render("DISTANCE (meters)", True, BLACK)
+        x_title = self._fonts["axis_title"].render("TIME (samples)", True, BLACK)
         self._screen.blit(
             x_title, (plot.centerx - x_title.get_width() // 2, plot.bottom + 24)
         )
 
-        # --- Live data: bars, reference lines, banner, peak marker ----------
-        peak_marker = None  # (peak_x, apex_y, range_m)
-        if app_state == "running" and result is not None:
-            profile = np.asarray(result["range_profile"], dtype=float)
-            # Downsample for display only (101 bars instead of 201).
-            profile_disp = profile[::2]
-            n_disp = profile_disp.size
-            if n_disp > 0:
-                profile_db = np.clip(
-                    _amplitude_to_db(profile_disp), 0.0, Y_DB_MAX
+        # --- Live data: time-sample bars, threshold line, banner ------------
+        if app_state == "running":
+            detected = bool(result["detected"]) if result else False
+
+            # Detection threshold = empty-room baseline + margin. Only the
+            # app/level mode supplies a baseline; classic mode leaves it out.
+            threshold_db = None
+            if result is not None and result.get("baseline_db") is not None:
+                threshold_db = float(result["baseline_db"]) + float(
+                    result.get("detection_margin_db", 0.0)
                 )
-                detected = bool(result["detected"])
 
-                # Detection threshold = empty-room baseline + margin. Only the
-                # app/level mode supplies a baseline; classic mode leaves it out.
-                baseline_db = result.get("baseline_db")
-                threshold_db = None
-                if baseline_db is not None:
-                    threshold_db = float(baseline_db) + float(
-                        result.get("detection_margin_db", 0.0)
-                    )
+            # One slot per sample in the rolling window; the newest sample sits
+            # at the right edge so the series scrolls right-to-left over time.
+            n = len(history)
+            slot_w = plot.w / SIGNAL_HISTORY_LEN
+            bar_w = max(1, int(round(slot_w * 0.7)))
+            for k in range(n):
+                db = max(0.0, min(Y_DB_MAX, float(history[k])))
+                h = int(round((db / Y_DB_MAX) * plot.h))
+                slot_index = SIGNAL_HISTORY_LEN - n + k  # newest -> rightmost
+                slot_left = plot.x + slot_index * slot_w
+                x0 = int(round(slot_left + (slot_w - bar_w) / 2))
+                bar = pygame.Rect(x0, plot.bottom - h, bar_w, h)
+                # A sample above the detection threshold is drawn bright red.
+                if threshold_db is not None and db > threshold_db:
+                    color = BAR_ALERT_RED
+                else:
+                    color = _bar_color(db)
+                pygame.draw.rect(
+                    self._screen, color, bar, border_radius=min(2, bar_w // 2)
+                )
 
-                # Slot = full width / bars; normal bars fill 60% of it. Bars that
-                # break the threshold while detected are widened and bright red.
-                slot_w = plot.w / n_disp
-                bar_w = max(1, int(round(slot_w * 0.6)))
-                alert_w = min(int(round(slot_w)), bar_w + 4)
-
-                for i in range(n_disp):
-                    db = float(profile_db[i])
-                    h = int(round((db / Y_DB_MAX) * plot.h))
-                    is_alert = (
-                        detected and threshold_db is not None and db > threshold_db
-                    )
-                    w = alert_w if is_alert else bar_w
-                    slot_left = plot.x + i * slot_w
-                    x0 = int(round(slot_left + (slot_w - w) / 2))
-                    bar = pygame.Rect(x0, plot.bottom - h, w, h)
-                    color = BAR_ALERT_RED if is_alert else _bar_color(db)
-                    pygame.draw.rect(
-                        self._screen, color, bar, border_radius=min(2, w // 2)
-                    )
-
-                # Dramatic detection banner across the top of the plot.
+            # Dramatic detection banner across the top of the plot.
+            if detected:
                 banner_h = 30
-                if detected:
-                    banner = pygame.Surface((plot.w, banner_h), pygame.SRCALPHA)
-                    banner.fill(BANNER_RGBA)
-                    self._screen.blit(banner, (plot.x, plot.top))
-                    text = self._fonts["banner"].render(
-                        self._warn_prefix + "TARGET DETECTED", True, WHITE
-                    )
-                    self._screen.blit(
-                        text,
-                        (plot.centerx - text.get_width() // 2,
-                         plot.top + (banner_h - text.get_height()) // 2),
-                    )
+                banner = pygame.Surface((plot.w, banner_h), pygame.SRCALPHA)
+                banner.fill(BANNER_RGBA)
+                self._screen.blit(banner, (plot.x, plot.top))
+                text = self._fonts["banner"].render(
+                    self._warn_prefix + "TARGET DETECTED", True, WHITE
+                )
+                self._screen.blit(
+                    text,
+                    (plot.centerx - text.get_width() // 2,
+                     plot.top + (banner_h - text.get_height()) // 2),
+                )
 
-                # Baseline (blue) and detection-threshold (red) reference lines.
-                if baseline_db is not None:
-                    self._draw_ref_line(
-                        plot, y_of_db(float(baseline_db)), BASELINE_LINE,
-                        "baseline", below=True)
-                    self._draw_ref_line(
-                        plot, y_of_db(threshold_db), THRESHOLD_LINE,
-                        "detection threshold", below=False)
-
-                # Peak marker above the tallest bar (kept clear of the banner).
-                peak_idx = int(np.argmax(profile_db))
-                peak_x = int(round(plot.x + peak_idx * slot_w + slot_w / 2))
-                peak_h = int(round((float(profile_db[peak_idx]) / Y_DB_MAX) * plot.h))
-                apex_y = plot.bottom - peak_h - 3
-                min_apex_y = plot.top + (banner_h + 12 if detected else 12)
-                apex_y = max(apex_y, min_apex_y)
-                peak_range_m = (peak_x - plot.x) / plot.w * X_RANGE_MAX_M
-                peak_marker = (peak_x, apex_y, peak_range_m)
+            # Detection-threshold reference line (red dashed) — baseline removed.
+            if threshold_db is not None:
+                self._draw_ref_line(
+                    plot, y_of_db(threshold_db), THRESHOLD_LINE,
+                    "detection threshold", below=False)
 
         # Axes border last so it frames the bars and banner cleanly.
         pygame.draw.rect(self._screen, BLACK, plot, BORDER_PX)
-
-        # Peak marker on top of the border: a downward triangle + distance.
-        if peak_marker is not None:
-            peak_x, apex_y, peak_range_m = peak_marker
-            pygame.draw.polygon(
-                self._screen, PEAK_MARKER,
-                [(peak_x - 6, apex_y - 10), (peak_x + 6, apex_y - 10),
-                 (peak_x, apex_y)],
-            )
-            label = self._fonts["peak"].render(
-                f"{peak_range_m:.1f} m", True, PEAK_MARKER
-            )
-            lx = peak_x + 9
-            if lx + label.get_width() > plot.right:
-                lx = peak_x - 9 - label.get_width()
-            ly = apex_y - 5 - label.get_height() // 2
-            self._blit_with_backing(label, (lx, ly))
 
     def _draw_ref_line(self, plot: pygame.Rect, y: int, color, text: str,
                        below: bool) -> None:

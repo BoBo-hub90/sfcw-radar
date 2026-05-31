@@ -161,3 +161,97 @@ def test_frequency_spectrum_shape_and_axis(pipeline):
     assert spectrum["freq_axis"].shape == (n,)
     assert spectrum["freq_axis"][0] == pytest.approx(1.0, abs=1e-6)
     assert spectrum["freq_axis"][-1] == pytest.approx(4.0, abs=1e-6)
+
+
+# ----------------------------------------------------------------------- #
+# level_detect
+# ----------------------------------------------------------------------- #
+
+def test_level_detect_above_margin(pipeline):
+    """A peak 5 dB over baseline clears the 1.5 dB margin and is detected."""
+    # signal 5 dB above baseline, margin is 1.5 → detected
+    result = pipeline.level_detect(signal_db=19.0, baseline_db=14.0)
+    assert result["detected"] is True
+    assert result["margin_above_baseline_db"] == 5.0
+
+
+def test_level_detect_below_margin(pipeline):
+    """A peak only 1 dB over baseline stays under the margin: no detection."""
+    # signal only 1 dB above baseline → not detected
+    result = pipeline.level_detect(signal_db=15.0, baseline_db=14.0)
+    assert result["detected"] is False
+
+
+def test_level_detect_returns_all_keys(pipeline):
+    """level_detect returns every documented key."""
+    result = pipeline.level_detect(signal_db=18.0, baseline_db=14.0)
+    for key in ["detected", "signal_db", "baseline_db",
+                "margin_above_baseline_db"]:
+        assert key in result
+
+
+# ----------------------------------------------------------------------- #
+# energy_detect
+# ----------------------------------------------------------------------- #
+
+def test_energy_detect_steady_scene_no_motion(pipeline):
+    """Identical-energy sweeps give a low ratio std: no motion detected."""
+    # feed identical-energy sweeps → low std → not detected
+    from collections import deque
+    history = deque(maxlen=5)
+    S = np.ones((1, 201), dtype=complex)
+    bg = np.ones((10, 201), dtype=complex)
+    for _ in range(5):
+        result = pipeline.energy_detect(S, bg, history)
+    assert result["detected"] is False
+    assert result["energy_std"] < 0.05
+
+
+def test_energy_detect_fluctuating_scene_motion(pipeline):
+    """Varying-energy sweeps give a high ratio std: motion detected."""
+    # feed varying-energy sweeps → high std → detected
+    from collections import deque
+    history = deque(maxlen=5)
+    bg = np.ones((10, 201), dtype=complex)
+    for amp in [1.0, 3.0, 0.5, 4.0, 2.0]:
+        S = np.ones((1, 201), dtype=complex) * amp
+        result = pipeline.energy_detect(S, bg, history)
+    assert result["detected"] is True
+    assert result["energy_std"] > 0.05
+
+
+def test_energy_detect_returns_all_keys(pipeline):
+    """energy_detect returns every documented key."""
+    from collections import deque
+    history = deque(maxlen=5)
+    S = np.ones((1, 201), dtype=complex)
+    bg = np.ones((10, 201), dtype=complex)
+    result = pipeline.energy_detect(S, bg, history)
+    for key in ["detected", "energy_ratio", "energy_std",
+                "current_energy_db", "background_energy_db"]:
+        assert key in result
+
+
+# ----------------------------------------------------------------------- #
+# doppler_process
+# ----------------------------------------------------------------------- #
+
+def test_doppler_process_output_keys(pipeline):
+    """doppler_process returns every documented key for a moving target."""
+    # synthetic moving target across sweeps
+    n_sweeps, n_steps = 20, 201
+    h = np.random.randn(n_sweeps, n_steps) + 1j*np.random.randn(n_sweeps, n_steps)
+    range_axis = np.linspace(0, 10, n_steps)
+    result = pipeline.doppler_process(h, range_axis)
+    for key in ["velocity_ms", "mean_velocity_ms", "doppler_spectrogram",
+                "doppler_v_axis", "doppler_t_axis", "target_range_m", "moving"]:
+        assert key in result
+
+
+def test_doppler_process_velocity_length(pipeline):
+    """The per-sweep velocity series has one sample per slow-time sweep."""
+    n_sweeps, n_steps = 20, 201
+    h = np.random.randn(n_sweeps, n_steps) + 1j*np.random.randn(n_sweeps, n_steps)
+    range_axis = np.linspace(0, 10, n_steps)
+    result = pipeline.doppler_process(h, range_axis)
+    assert len(result["velocity_ms"]) == n_sweeps

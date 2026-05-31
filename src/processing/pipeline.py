@@ -39,7 +39,8 @@ log = get_logger(__name__)
 # Speed of light (m/s).
 C = 299_792_458.0
 
-# CA-CFAR parameters (cells counted per side of the cell under test).
+# CA-CFAR defaults (cells counted per side of the cell under test). Used as a
+# fallback when the config has no `cfar` section.
 CFAR_GUARD_CELLS = 2
 CFAR_TRAINING_CELLS = 8
 CFAR_PFA = 1e-3
@@ -64,6 +65,15 @@ class RadarPipeline:
         self.delta_f = (self.f_stop - self.f_start) / (self.n_steps - 1)
 
         self.n_background_scans = int(proc["n_background_scans"])
+
+        # CA-CFAR tuning from the optional `cfar` config section (falls back to
+        # the module defaults when the section or a key is absent).
+        cfar = self.config.get("cfar", {})
+        self.cfar_guard_cells = int(cfar.get("guard_cells", CFAR_GUARD_CELLS))
+        self.cfar_training_cells = int(
+            cfar.get("training_cells", CFAR_TRAINING_CELLS)
+        )
+        self.cfar_pfa = float(cfar.get("false_alarm_rate", CFAR_PFA))
 
         # Range bin spacing and unambiguous span for an n_steps-point IFFT.
         self.range_resolution_m = C / (2.0 * self.n_steps * self.delta_f)
@@ -167,6 +177,10 @@ class RadarPipeline:
         S_clean = np.atleast_2d(np.asarray(S_clean, dtype=np.complex128))
         n_freq = S_clean.shape[1]
 
+        # Remove the per-sweep DC offset (zero-frequency LO leakage) before the
+        # IFFT so it does not pile up into the zero-range bin.
+        S_clean = S_clean - np.mean(S_clean, axis=-1, keepdims=True)
+
         window = np.hanning(n_freq)
         h_matrix = np.fft.ifft(S_clean * window[np.newaxis, :], axis=1)
 
@@ -214,8 +228,9 @@ class RadarPipeline:
         n = profile.size
 
         threshold = np.full(n, np.inf)
-        guard = CFAR_GUARD_CELLS
-        train = CFAR_TRAINING_CELLS
+        guard = self.cfar_guard_cells
+        train = self.cfar_training_cells
+        pfa = self.cfar_pfa
 
         for i in range(n):
             # Leading and lagging training windows, clipped to the array.
@@ -228,7 +243,7 @@ class RadarPipeline:
                 continue  # leave threshold at +inf -> no detection
 
             noise = training.mean()
-            alpha = n_train * (CFAR_PFA ** (-1.0 / n_train) - 1.0)
+            alpha = n_train * (pfa ** (-1.0 / n_train) - 1.0)
             threshold[i] = alpha * noise
 
         detections = profile > threshold

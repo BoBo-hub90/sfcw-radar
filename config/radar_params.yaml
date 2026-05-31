@@ -17,6 +17,11 @@ processing:
   respiration_band: [0.15, 0.40]
   heartrate_band:   [1.00, 2.50]
 
+cfar:
+  guard_cells: 2
+  training_cells: 8
+  false_alarm_rate: 1e-2   # relaxed from 1e-3 to 1e-2
+
 performance:
   range_resolution_m: 0.05
   max_range_m: 10.0

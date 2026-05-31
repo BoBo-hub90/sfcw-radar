@@ -101,11 +101,47 @@ def parse_args() -> argparse.Namespace:
         help="Use the energy detector (current/background mean-power ratio) "
              "alongside the CFAR pipeline and print the energy ratio.",
     )
+    parser.add_argument(
+        "--level",
+        action="store_true",
+        help="Use the signal-level detector: compare the current peak range-"
+             "profile dB against the empty-room baseline captured at warmup. "
+             "Its verdict becomes the primary 'detected' result feeding the UI.",
+    )
     return parser.parse_args()
 
 
 # Save a figure at this frame interval when --plot is enabled.
 PLOT_EVERY_N_FRAMES = 10
+
+
+def level_range_profile(
+    pipeline: RadarPipeline, s_raw: np.ndarray, s_ref: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """
+    No-background range profile (magnitude) and its peak dB for one sweep.
+
+    The signal-level detector keys on the absolute peak level, so the profile
+    must NOT have background subtraction applied (which would cancel the static
+    empty-room return the baseline is built from). This mirrors the no-bg path:
+    phase_correction -> range_profile, then collapses the single sweep to a 1-D
+    magnitude profile.
+
+    Args:
+        pipeline: The configured RadarPipeline.
+        s_raw: One measurement-path sweep, shape (n_steps,).
+        s_ref: The matching reference-path sweep (ones when --no-ref).
+
+    Returns:
+        (profile, peak_db):
+          profile : 1-D magnitude range profile, shape (n_steps,).
+          peak_db : float, 20*log10(max(profile) + 1e-9).
+    """
+    s_corrected = pipeline.phase_correction(s_raw, s_ref)
+    h_matrix, _ = pipeline.range_profile(s_corrected)
+    profile = np.abs(h_matrix).mean(axis=0)
+    peak_db = 20.0 * np.log10(profile.max() + 1e-9)
+    return profile, float(peak_db)
 
 
 def save_debug_arrays(result: dict, spectrum: dict, frame_index: int) -> None:
@@ -233,15 +269,27 @@ def main() -> None:
     # variance-based energy detector keys on (motion = a fluctuating ratio).
     energy_ratios: deque[float] = deque(maxlen=5)
 
+    # Empty-room peak-dB baseline for the signal-level detector (--level),
+    # averaged over the warmup sweeps below.
+    baseline_db = 0.0
+
     try:
         # --- Warmup: fill the background buffer ---
         print(f"Warming up: capturing {n_warmup} background sweeps...")
+        baseline_peak_dbs: list[float] = []
         for _ in range(n_warmup):
             s_raw, s_ref = capture_sweep()
             raw_buffer.append(s_raw)
             ref_buffer.append(s_ref)
             background_sweeps.append(s_raw)
+            # Accumulate each empty-room sweep's peak dB for the level baseline.
+            if args.level:
+                _, peak_db = level_range_profile(pipeline, s_raw, s_ref)
+                baseline_peak_dbs.append(peak_db)
         background_matrix = np.asarray(background_sweeps)
+        if args.level and baseline_peak_dbs:
+            baseline_db = float(np.mean(baseline_peak_dbs))
+            print(f"Level baseline (empty room): {baseline_db:.2f} dB")
         print("Warmup complete. Entering detection loop (Ctrl+C to stop).")
 
         # --- Continuous detection loop ---
@@ -258,12 +306,30 @@ def main() -> None:
             else:
                 result = pipeline.run(S_raw, S_ref, doppler=args.doppler)
 
+            # Signal-level detector: when --level is set, its absolute peak-dB
+            # verdict becomes the primary 'detected' result feeding the UI. The
+            # current sweep's no-background range profile also replaces the one
+            # in `result`, so the display's SIGNAL dB card and chart reflect the
+            # exact level the detector compared against the baseline.
+            level = None
+            if args.level:
+                profile, signal_db = level_range_profile(pipeline, s_raw, s_ref)
+                level = pipeline.level_detect(signal_db, baseline_db)
+                result["detected"] = level["detected"]
+                result["range_profile"] = profile
+
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             line = (
                 f"[{timestamp}] detected={str(result['detected']):5s}  "
                 f"target_range_m={result['target_range_m']:.3f}  "
                 f"peak_to_mean={result['peak_to_mean']:.2f}"
             )
+            if level is not None:
+                line += (
+                    f"  signal_db={level['signal_db']:.2f}  "
+                    f"baseline_db={level['baseline_db']:.2f}  "
+                    f"margin_db={level['margin_above_baseline_db']:+.2f}"
+                )
             if args.doppler:
                 line += (
                     f"  mean_velocity_ms={result['mean_velocity_ms']:+.3f}  "

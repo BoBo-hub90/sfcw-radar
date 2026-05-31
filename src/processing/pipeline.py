@@ -108,6 +108,12 @@ class RadarPipeline:
             proc.get("energy_variance_threshold", 0.05)
         )
 
+        # Signal-level detector margin: how many dB the current peak range-
+        # profile magnitude must exceed the empty-room baseline to declare a
+        # target. Hardware testing showed a consistent 2-7 dB rise when a person
+        # is present (even behind a wooden board) over a ~14 dB empty baseline.
+        self.detection_margin_db = float(proc.get("detection_margin_db", 1.5))
+
         # CA-CFAR tuning from the optional `cfar` config section (falls back to
         # the module defaults when the section or a key is absent).
         cfar = self.config.get("cfar", {})
@@ -435,6 +441,51 @@ class RadarPipeline:
             "energy_std": energy_std,
             "current_energy_db": float(current_energy_db),
             "background_energy_db": float(background_energy_db),
+        }
+
+    # ------------------------------------------------------------------ #
+    # Stage 4d — signal-level presence detector (CFAR alternative)
+    # ------------------------------------------------------------------ #
+
+    def level_detect(self, signal_db: float, baseline_db: float) -> dict:
+        """
+        Presence detector from the absolute peak range-profile level in dB.
+
+        Hardware testing showed the peak magnitude of the (no-background) range
+        profile is a reliable presence indicator: an empty room sits near a
+        ~14 dB baseline, and a person — even behind a wooden board — raises it
+        to ~16-21 dB, a consistent, monotonic-with-proximity 2-7 dB rise.
+
+        This compares the current peak level against an empty-room baseline
+        captured during warmup and declares a target when it exceeds the
+        baseline by at least `detection_margin_db`. Unlike CFAR (which needs one
+        bin to stand out from its neighbours) or the variance detector (which
+        needs motion), this fires on a *stationary* person as long as the
+        overall level has risen.
+
+        Args:
+            signal_db: Current peak magnitude in dB,
+                20*log10(max(range_profile) + 1e-9).
+            baseline_db: Empty-room reference peak dB captured during warmup.
+
+        Returns:
+            dict with keys:
+              detected                 : bool, signal_db exceeds the baseline by
+                                         at least detection_margin_db.
+              signal_db                : float, the current peak level (echoed).
+              baseline_db              : float, the baseline level (echoed).
+              margin_above_baseline_db : float, signal_db - baseline_db.
+        """
+        signal_db = float(signal_db)
+        baseline_db = float(baseline_db)
+        margin_above_baseline_db = signal_db - baseline_db
+        detected = bool(signal_db > (baseline_db + self.detection_margin_db))
+
+        return {
+            "detected": detected,
+            "signal_db": signal_db,
+            "baseline_db": baseline_db,
+            "margin_above_baseline_db": margin_above_baseline_db,
         }
 
     # ------------------------------------------------------------------ #

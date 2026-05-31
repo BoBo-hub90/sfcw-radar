@@ -11,6 +11,7 @@ pluto:
   ip: "ip:192.168.2.1"
   sample_rate: 2.5e6
   rx_buffer_size: 1024
+  dwell_buffers: 1   # buffers averaged per LO step (1 = fastest sweep)
 
 processing:
   n_background_scans: 10

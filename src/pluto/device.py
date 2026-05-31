@@ -110,6 +110,8 @@ class PlutoDevice:
 
         self._sdr: adi.Pluto | None = None
         self._cw_active: bool = False
+        # Handle to the reused RX capture buffer (allocated once in configure()).
+        self._rx_buffer = None
 
         # Captured fastlock profiles (host-side), one string per frequency step.
         self._tx_profiles: list[str] = []
@@ -215,6 +217,18 @@ class PlutoDevice:
         # RX capture size.
         s.rx_buffer_size = int(self.rx_buffer_size)
         log.info("  rx_buffer_size  : %d", s.rx_buffer_size)
+
+        # Pre-allocate the RX capture buffer once and keep it for the whole run.
+        # pyadi-iio builds the underlying iio.Buffer lazily on the first rx()
+        # and then reuses it on every subsequent call; priming it here moves
+        # that one-time allocation out of the timing-critical sweep loop. The
+        # buffer is invalidated only if rx_buffer_size changes, so we drop any
+        # stale buffer first (e.g. on a re-configure).
+        s.rx_destroy_buffer()
+        s.rx()  # first capture allocates and caches the buffer on the device
+        self._rx_buffer = getattr(s, "_rxbuf", None)
+        log.info("  rx_buffer       : preallocated (%s)",
+                 "ok" if self._rx_buffer is not None else "unavailable")
 
         log.info("Channel configuration complete")
 
@@ -357,6 +371,11 @@ class PlutoDevice:
             complex64 array of shape (num_buffers * rx_buffer_size,).
         """
         s = self._require_sdr()
+        # Each s.rx() reuses the iio.Buffer pre-allocated in configure() (pyadi
+        # caches it on the device), so no buffer is created here. The single-
+        # buffer case avoids the concatenate copy that dominates a short dwell.
+        if num_buffers == 1:
+            return s.rx().astype(np.complex64)
         buffers = [s.rx() for _ in range(num_buffers)]
         return np.concatenate(buffers).astype(np.complex64)
 

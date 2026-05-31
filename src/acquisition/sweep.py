@@ -53,11 +53,15 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# Minimum buffer fills per step (dwell), per requirements.
-DEFAULT_DWELL_BUFFERS = 5
+# Default buffer fills averaged per step (dwell). One buffer is the minimum
+# viable; raise it (via pluto.dwell_buffers in the config) to trade sweep speed
+# for SNR. Overridden by the config value when present.
+DEFAULT_DWELL_BUFFERS = 1
 
-# One buffer is read and discarded after an LO hop / switch toggle to drop
-# samples that were in flight before the new state settled.
+# One buffer is read and discarded immediately after an LO hop to drop the
+# samples that were in flight while the PLL was still settling. This flush is
+# essential; no separate flush is taken after an RF-switch toggle (the switch's
+# own settle sleep covers that), which keeps the per-step buffer count low.
 WARMUP_BUFFERS = 1
 
 # Settle time (seconds) after toggling the RF switch before capturing.
@@ -144,25 +148,30 @@ class SFCWSweep:
         self,
         device: PlutoDevice,
         switch_gpio_pin: int = 17,
-        dwell_buffers: int = DEFAULT_DWELL_BUFFERS,
+        dwell_buffers: int | None = None,
     ):
         """
         Args:
             device: A PlutoDevice that is already connected, configured, and has
                 fastlock profiles stored (store_fastlock_profiles()).
             switch_gpio_pin: BCM pin number controlling the reference RF switch.
-            dwell_buffers: Buffer fills averaged per step (clamped to >= 5).
+            dwell_buffers: Buffer fills averaged per step. When None (default),
+                the value is read from the config's `pluto.dwell_buffers`,
+                falling back to DEFAULT_DWELL_BUFFERS. Clamped to >= 1.
         """
         self.device = device
         self.n_steps = device.n_steps
 
-        if dwell_buffers < DEFAULT_DWELL_BUFFERS:
-            log.warning(
-                "dwell_buffers=%d below minimum; clamping to %d",
-                dwell_buffers, DEFAULT_DWELL_BUFFERS,
-            )
-            dwell_buffers = DEFAULT_DWELL_BUFFERS
+        # Resolve dwell from the explicit arg, else the config, else the default.
+        if dwell_buffers is None:
+            pluto_cfg = device.config.get("pluto", {})
+            dwell_buffers = int(pluto_cfg.get("dwell_buffers", DEFAULT_DWELL_BUFFERS))
+        if dwell_buffers < 1:
+            log.warning("dwell_buffers=%d below minimum; clamping to 1",
+                        dwell_buffers)
+            dwell_buffers = 1
         self.dwell_buffers = dwell_buffers
+        log.info("SFCWSweep dwell_buffers=%d", self.dwell_buffers)
 
         self.switch = _RFSwitch(switch_gpio_pin)
 
@@ -170,15 +179,24 @@ class SFCWSweep:
     # Per-step measurement
     # ------------------------------------------------------------------ #
 
-    def _measure_phasor(self) -> complex:
+    def _flush_after_hop(self) -> None:
         """
-        Dwell on the current LO and return the mean complex IQ phasor.
+        Discard one buffer after an LO hop to drop PLL-settling transients.
 
-        One warm-up buffer is discarded, then `dwell_buffers` buffers are
-        captured and averaged across all of their samples.
+        Called once per step right after recall_profile(); a single flush covers
+        both phasor captures (reference + measurement) that share the same LO.
         """
         if WARMUP_BUFFERS:
             self.device.receive(num_buffers=WARMUP_BUFFERS)
+
+    def _measure_phasor(self) -> complex:
+        """
+        Dwell on the current LO/path and return the mean complex IQ phasor.
+
+        Captures `dwell_buffers` buffers and averages across all their samples.
+        The post-hop flush is handled separately by _flush_after_hop(), so no
+        warm-up buffer is discarded here.
+        """
         samples = self.device.receive(num_buffers=self.dwell_buffers)
         return complex(np.mean(samples))
 
@@ -196,6 +214,7 @@ class SFCWSweep:
         self.switch.to_measurement()
         for i in range(self.n_steps):
             self.device.recall_profile(i)
+            self._flush_after_hop()
             out[i] = self._measure_phasor()
 
     def run_sweep(self) -> np.ndarray:
@@ -234,6 +253,8 @@ class SFCWSweep:
         try:
             for i in range(self.n_steps):
                 self.device.recall_profile(i)
+                # One flush per LO hop; both path captures below reuse it.
+                self._flush_after_hop()
 
                 self.switch.to_reference()
                 s_ref[i] = self._measure_phasor()

@@ -225,9 +225,13 @@ def main() -> None:
 
     # Static snapshot of the empty-scene warmup sweeps, used as the baseline
     # for the energy detector (--energy). Captured once and never updated so a
-    # person entering later raises the current/background power ratio.
+    # person entering later changes the current/background power ratio.
     background_sweeps: list[np.ndarray] = []
     background_matrix: np.ndarray | None = None
+
+    # Rolling window of recent energy ratios; its std deviation is what the
+    # variance-based energy detector keys on (motion = a fluctuating ratio).
+    energy_ratios: deque[float] = deque(maxlen=5)
 
     try:
         # --- Warmup: fill the background buffer ---
@@ -266,13 +270,17 @@ def main() -> None:
                     f"moving={str(result['moving']):5s}"
                 )
 
-            # Energy detector runs alongside CFAR: compare the current sweeps'
-            # mean power against the empty-scene warmup baseline.
+            # Energy detector runs alongside CFAR: track the current/background
+            # power ratio over a rolling window and flag motion when its std
+            # deviation rises.
             if args.energy:
-                energy = pipeline.energy_detect(S_raw, background_matrix)
+                energy = pipeline.energy_detect(
+                    S_raw, background_matrix, energy_ratios
+                )
                 line += (
                     f"  energy_detected={str(energy['detected']):5s}  "
-                    f"energy_ratio={energy['energy_ratio']:.2f}"
+                    f"energy_ratio={energy['energy_ratio']:.2f}  "
+                    f"energy_std={energy['energy_std']:.3f}"
                 )
             print(line)
 

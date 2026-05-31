@@ -29,6 +29,8 @@ max_range_m.
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 import yaml
 
@@ -97,6 +99,14 @@ class RadarPipeline:
         # Energy-detector threshold: the current/background mean-power ratio
         # above which a target (e.g. a person entering the scene) is declared.
         self.energy_threshold = float(proc.get("energy_threshold", 1.5))
+
+        # Energy-variance threshold: the std deviation of the recent energy
+        # ratios above which motion (a *changing* scene) is declared. This keys
+        # on change rather than absolute level, so a static person/clutter that
+        # merely raises the level does not trip it but movement does.
+        self.energy_variance_threshold = float(
+            proc.get("energy_variance_threshold", 0.05)
+        )
 
         # CA-CFAR tuning from the optional `cfar` config section (falls back to
         # the module defaults when the section or a key is absent).
@@ -345,32 +355,46 @@ class RadarPipeline:
     # ------------------------------------------------------------------ #
 
     def energy_detect(
-        self, S_matrix: np.ndarray, background_matrix: np.ndarray
+        self,
+        S_matrix: np.ndarray,
+        background_matrix: np.ndarray,
+        ratio_history: deque | None = None,
     ) -> dict:
         """
-        Coarse presence detector from total received energy vs a baseline.
+        Motion detector from the *variance* of the energy ratio over time.
 
-        Rather than localising a target in range (CFAR), this compares the mean
-        power of the current sweeps against the mean power of the empty-scene
-        warmup sweeps. A person entering the beam adds reflected energy, so the
-        ratio rises above 1; declaring detection when it exceeds
-        `energy_threshold` gives a robust yes/no even when no single range bin
-        stands out (the failure mode that defeats CFAR under heavy coupling).
+        Rather than localising a target in range (CFAR), this tracks the total
+        received power relative to the empty-scene warmup baseline and keys on
+        how much that ratio *changes*, not its absolute level. A static scene
+        (even a leaky front end or a stationary person that merely raises the
+        level) holds a steady ratio, so its sliding-window std deviation stays
+        low; real motion makes the ratio fluctuate and the std rise above
+        `energy_variance_threshold`. This is robust where CFAR fails under heavy
+        direct coupling.
+
+        The current ratio is computed from this frame's mean power over the
+        baseline, then appended to `ratio_history` (a caller-owned rolling
+        window). Detection is std(ratio_history) > energy_variance_threshold.
 
         Power is averaged over every element of each stack (all sweeps and all
-        LO steps), so the result is independent of how many sweeps each stack
+        LO steps), so the ratio is independent of how many sweeps each stack
         holds.
 
         Args:
             S_matrix: Current sweeps, shape (n_sweeps, n_steps).
             background_matrix: Empty-scene warmup sweeps, shape
                 (n_background_scans, n_steps).
+            ratio_history: Caller-owned rolling buffer (e.g. deque(maxlen=5)) of
+                recent energy ratios. The freshly computed ratio is appended to
+                it in place; its std deviation drives the decision. When None, a
+                fresh single-element window is used (std 0 -> no detection).
 
         Returns:
             dict with keys:
-              detected            : bool, energy_ratio > energy_threshold.
-              energy_ratio        : float, current / background mean power.
-              current_energy_db   : float, 10*log10(current mean power).
+              detected             : bool, energy_std > energy_variance_threshold.
+              energy_ratio         : float, current / background mean power.
+              energy_std           : float, std deviation of the recent ratios.
+              current_energy_db    : float, 10*log10(current mean power).
               background_energy_db : float, 10*log10(background mean power).
         """
         S_matrix = np.asarray(S_matrix)
@@ -387,7 +411,20 @@ class RadarPipeline:
                         "reporting ratio as inf")
             energy_ratio = float("inf")
 
-        detected = bool(energy_ratio > self.energy_threshold)
+        # Append this frame's ratio to the caller-owned rolling window and take
+        # the std deviation over it. A short window (a few frames) makes the
+        # detector responsive to onset/offset of motion.
+        if ratio_history is None:
+            ratio_history = deque([energy_ratio], maxlen=5)
+        else:
+            ratio_history.append(energy_ratio)
+
+        # np.std on a window that still contains inf (zero-background guard)
+        # would be nan; treat that as "no usable estimate" -> std 0.
+        finite = [r for r in ratio_history if np.isfinite(r)]
+        energy_std = float(np.std(finite)) if len(finite) > 1 else 0.0
+
+        detected = bool(energy_std > self.energy_variance_threshold)
 
         current_energy_db = 10.0 * np.log10(current_energy + 1e-12)
         background_energy_db = 10.0 * np.log10(background_energy + 1e-12)
@@ -395,6 +432,7 @@ class RadarPipeline:
         return {
             "detected": detected,
             "energy_ratio": energy_ratio,
+            "energy_std": energy_std,
             "current_energy_db": float(current_energy_db),
             "background_energy_db": float(background_energy_db),
         }

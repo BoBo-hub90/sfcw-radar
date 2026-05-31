@@ -72,9 +72,9 @@ TOP_BAR_BG = (30, 30, 30)        # #1e1e1e dark strip
 TITLE_PAD_X = 16                 # left padding of the "TWR RADAR" title
 
 # START/STOP button fills by app state, plus the CLOSE button fill.
-BTN_GREEN = (42, 107, 42)        # #2a6b2a  idle       -> "BASLAT"
-BTN_RED = (178, 34, 34)          # #b22222  running    -> "DURDUR"
-BTN_GREY = (136, 136, 136)       # #888888  connecting -> "BEKLEYIN" (inert)
+BTN_GREEN = (42, 107, 42)        # #2a6b2a  idle       -> "START"
+BTN_RED = (178, 34, 34)          # #b22222  running    -> "STOP"
+BTN_GREY = (136, 136, 136)       # #888888  connecting -> "WAIT" (inert)
 CLOSE_RED = (204, 0, 0)          # #cc0000  close button fill
 BTN_RADIUS = 6
 
@@ -244,10 +244,10 @@ class RadarDisplay:
                 "title": self._font(22, bold=True),
                 "axis": self._font(16),
                 # Small status hint line (idle/connecting) — kept narrow so the
-                # longer Turkish-style prompt stays inside the card.
+                # longer idle prompt stays inside the card.
                 "hint": self._font(15),
                 # Top-bar chrome uses DejaVu (falling back to the default font)
-                # so the ASCII Turkish-style labels render cleanly.
+                # so the ASCII labels render cleanly.
                 "topbar_title": self._load_font(24, bold=True),
                 "button": self._load_font(22, bold=True),
                 "close": self._load_font(26, bold=True),
@@ -280,8 +280,8 @@ class RadarDisplay:
 
         Prefers the system "dejavusans" face, then the well-known DejaVu TTF
         path on Debian / Raspberry Pi OS, and finally pygame's built-in default
-        font. DejaVu carries the Latin glyphs used by the ASCII Turkish-style
-        labels (BASLAT, DURDUR, ...), so they render without missing-glyph boxes.
+        font. DejaVu provides clean Latin glyphs for the UI labels (START, STOP,
+        ...), so they render crisply without falling back to missing-glyph boxes.
         """
         # 1) System DejaVu face (only when actually present, since SysFont
         #    silently substitutes the default font for an unknown name).
@@ -372,11 +372,11 @@ class RadarDisplay:
 
         # START/STOP button: fill and label follow the app state.
         if app_state == "running":
-            btn_fill, btn_label = BTN_RED, "DURDUR"
+            btn_fill, btn_label = BTN_RED, "STOP"
         elif app_state == "connecting":
-            btn_fill, btn_label = BTN_GREY, "BEKLEYIN"
+            btn_fill, btn_label = BTN_GREY, "WAIT"
         else:  # idle
-            btn_fill, btn_label = BTN_GREEN, "BASLAT"
+            btn_fill, btn_label = BTN_GREEN, "START"
         pygame.draw.rect(
             self._screen, btn_fill, START_STOP_BTN, border_radius=BTN_RADIUS
         )
@@ -401,11 +401,11 @@ class RadarDisplay:
         """Card 1 — detection state (running) or kiosk status (idle/connecting)."""
         if app_state == "idle":
             fill, border, value_color = WHITE, GREY_BORDER, BLACK
-            value_text, sub_text = "HAZIR", "Baslatmak icin BASLAT'a dokun"
+            value_text, sub_text = "READY", "Tap START to begin"
             sub_font, sub_color = "hint", GREY_LABEL
         elif app_state == "connecting":
             fill, border, value_color = WHITE, GREY_BORDER, BLACK
-            value_text, sub_text = "BAGLANIYOR...", "Pluto hazirlaniyor"
+            value_text, sub_text = "CONNECTING...", "Preparing Pluto"
             sub_font, sub_color = "hint", GREY_LABEL
         else:  # running — normal detection result
             detected = bool(result["detected"]) if result else False

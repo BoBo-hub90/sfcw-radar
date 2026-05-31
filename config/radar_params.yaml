@@ -11,6 +11,7 @@ pluto:
   ip: "ip:192.168.2.1"
   sample_rate: 2.5e6
   rx_buffer_size: 1024
+  rx_gain_db: 20     # lowered from 40 to avoid ADC saturation
   dwell_buffers: 1   # buffers averaged per LO step (1 = fastest sweep)
 
 processing:

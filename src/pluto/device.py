@@ -67,9 +67,11 @@ FASTLOCK_SLOT = 0
 # is uncalibrated and approximate; treat tx_power_dbm as a relative setpoint.
 TX_MAX_POWER_DBM = 0.0
 
-# Default RX path gain. The radar config does not specify an RX gain, and phase
-# stability for vital-sign extraction strongly favours a fixed manual gain over
-# AGC, so a manual default is used here.
+# Fallback RX path gain, used only when `pluto.rx_gain_db` is absent from the
+# config. Phase stability for vital-sign extraction strongly favours a fixed
+# manual gain over AGC, so a manual value is always applied. The configured
+# default (20 dB) is deliberately well below this to keep the 12-bit ADC out of
+# saturation given the strong TX->RX coupling of a monostatic SFCW front end.
 DEFAULT_RX_GAIN_DB = 40.0
 
 # Pluto TX DAC expects int16 IQ with full scale at 2^14 = 16384; 2^15-1 clips.
@@ -107,6 +109,11 @@ class PlutoDevice:
         self.uri: str = str(pluto["ip"])
         self.sample_rate: int = int(float(pluto["sample_rate"]))
         self.rx_buffer_size: int = int(pluto["rx_buffer_size"])
+        # RX gain (manual). Read from config so it can be tuned to avoid ADC
+        # saturation; falls back to DEFAULT_RX_GAIN_DB when the key is missing.
+        self.rx_gain_db: float = float(
+            pluto.get("rx_gain_db", DEFAULT_RX_GAIN_DB)
+        )
 
         self._sdr: adi.Pluto | None = None
         self._cw_active: bool = False
@@ -203,9 +210,10 @@ class PlutoDevice:
         s.rx_lo = int(self.f_start)
         log.info("  tx_lo / rx_lo   : %d Hz (sweep start)", int(self.f_start))
 
-        # RX gain: fixed manual gain for phase stability.
+        # RX gain: fixed manual gain for phase stability, from config so it can
+        # be lowered to keep the ADC out of saturation.
         s.gain_control_mode_chan0 = "manual"
-        s.rx_hardwaregain_chan0 = float(DEFAULT_RX_GAIN_DB)
+        s.rx_hardwaregain_chan0 = float(self.rx_gain_db)
         log.info("  rx_gain         : %.1f dB (manual)", s.rx_hardwaregain_chan0)
 
         # TX power: map requested dBm to Pluto's attenuation attribute.
@@ -378,6 +386,53 @@ class PlutoDevice:
             return s.rx().astype(np.complex64)
         buffers = [s.rx() for _ in range(num_buffers)]
         return np.concatenate(buffers).astype(np.complex64)
+
+    def check_rx_level(self) -> dict:
+        """
+        Capture one RX buffer and report its level and ADC saturation.
+
+        A bring-up aid for verifying the RX gain is low enough to keep the
+        converter out of saturation. pyadi returns IQ as int16, but the AD9361
+        ADC is 12-bit signed, so each I/Q rail saturates near +/-2047 counts;
+        a sample is counted as clipped when |I| or |Q| exceeds 90% of that.
+
+        Returns:
+            dict with:
+                mean_magnitude:  mean |IQ| over the buffer
+                max_magnitude:   peak |IQ| over the buffer
+                saturation_pct:  fraction of samples (0..1) whose |I| or |Q|
+                                 exceeds 0.9 * full scale
+                is_saturated:    True when saturation_pct > 0.01 (> 1% clipped)
+        """
+        iq = self.receive(1)
+        magnitude = np.abs(iq)
+
+        full_scale = 2047.0  # 12-bit signed ADC full scale (per I/Q rail)
+        sat_threshold = 0.9 * full_scale
+        if iq.size:
+            clipped = (np.abs(iq.real) > sat_threshold) | (
+                np.abs(iq.imag) > sat_threshold
+            )
+            saturation_pct = float(np.mean(clipped))
+            mean_magnitude = float(np.mean(magnitude))
+            max_magnitude = float(np.max(magnitude))
+        else:
+            saturation_pct = 0.0
+            mean_magnitude = 0.0
+            max_magnitude = 0.0
+
+        result = {
+            "mean_magnitude": mean_magnitude,
+            "max_magnitude": max_magnitude,
+            "saturation_pct": saturation_pct,
+            "is_saturated": saturation_pct > 0.01,
+        }
+        log.info(
+            "RX level: mean=%.1f max=%.1f saturation=%.2f%% (%s)",
+            mean_magnitude, max_magnitude, saturation_pct * 100.0,
+            "SATURATED" if result["is_saturated"] else "ok",
+        )
+        return result
 
     # ------------------------------------------------------------------ #
     # Low-level LO attribute access (pyadi-iio helpers)

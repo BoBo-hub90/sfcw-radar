@@ -17,6 +17,8 @@ processing:
   n_background_scans: 10
   respiration_band: [0.15, 0.40]
   heartrate_band:   [1.00, 2.50]
+  sweep_period_s: 1.5              # slow-time sampling interval (s per sweep)
+  doppler_motion_threshold_ms: 0.05 # |mean velocity| above this = "moving"
 
 cfar:
   guard_cells: 2

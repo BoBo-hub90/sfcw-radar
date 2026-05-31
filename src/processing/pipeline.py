@@ -66,6 +66,14 @@ class RadarPipeline:
 
         self.n_background_scans = int(proc["n_background_scans"])
 
+        # Doppler / micro-Doppler parameters. The sweep period (slow-time
+        # sampling interval) sets the velocity scaling; the motion threshold is
+        # the |mean velocity| above which a target is flagged as moving.
+        self.sweep_period_s = float(proc.get("sweep_period_s", 1.5))
+        self.doppler_motion_threshold_ms = float(
+            proc.get("doppler_motion_threshold_ms", 0.05)
+        )
+
         # CA-CFAR tuning from the optional `cfar` config section (falls back to
         # the module defaults when the section or a key is absent).
         cfar = self.config.get("cfar", {})
@@ -264,6 +272,120 @@ class RadarPipeline:
         }
 
     # ------------------------------------------------------------------ #
+    # Stage 4b — Doppler / micro-Doppler (slow-time phase)
+    # ------------------------------------------------------------------ #
+
+    def doppler_process(
+        self, h_matrix: np.ndarray, range_axis: np.ndarray
+    ) -> dict:
+        """
+        Estimate radial velocity and a micro-Doppler signature at the target bin.
+
+        Where cfar_detect collapses slow time to a single magnitude profile,
+        this looks *along* slow time at the strongest range bin and reads the
+        target's motion out of the phase evolution there:
+
+          1. Pick the target bin as the peak of the mean |h| range profile
+             (the same cell cfar_detect reports).
+          2. theta(t) = arctan2(Im, Re) of h at that bin, then np.unwrap to
+             remove 2*pi jumps so the phase tracks continuously.
+          3. A round-trip of range R contributes a phase 4*pi*R/lambda, so the
+             radial velocity is v(t) = -(lambda / 4*pi) * dtheta/dt, evaluated
+             at the carrier wavelength lambda = c / f0 with f0 the sweep's
+             centre frequency. The derivative is taken over the slow-time axis
+             (spacing = sweep_period_s) and lightly smoothed.
+          4. A short-time Fourier transform of the complex bin signal gives the
+             micro-Doppler spectrogram: a walking person shows a steady torso
+             line plus swinging-limb sidebands, separating it from a rigid body.
+
+        Args:
+            h_matrix: Range profiles, shape (n_sweeps, n_steps).
+            range_axis: Range axis in meters, shape (n_steps,).
+
+        Returns:
+            dict with keys:
+              velocity_ms         : 1-D array (n_sweeps,), smoothed radial
+                                    velocity per slow-time sample.
+              mean_velocity_ms    : float, mean of velocity_ms.
+              doppler_spectrogram : 2-D array (n_v, n_frames), micro-Doppler
+                                    magnitude (|STFT|) at the target bin.
+              doppler_v_axis      : 1-D array (n_v,), velocity axis (m/s) of the
+                                    spectrogram rows (ascending).
+              doppler_t_axis      : 1-D array (n_frames,), slow-time centre of
+                                    each STFT frame in seconds.
+              target_range_m      : float, range of the analysed bin (meters).
+              moving              : bool, |mean_velocity_ms| exceeds the config
+                                    motion threshold.
+        """
+        from scipy.ndimage import uniform_filter1d
+
+        h_matrix = np.atleast_2d(np.asarray(h_matrix))
+        n_sweeps = h_matrix.shape[0]
+
+        # --- Step 1: target bin = peak of the mean magnitude range profile ---
+        profile = np.abs(h_matrix).mean(axis=0)
+        target_bin = int(np.argmax(profile))
+        target_range_m = float(range_axis[target_bin])
+
+        # Complex slow-time signal at the target bin.
+        bin_signal = h_matrix[:, target_bin]
+
+        # --- Step 2: unwrapped phase along slow time ---
+        theta = np.unwrap(np.arctan2(bin_signal.imag, bin_signal.real))
+
+        # --- Step 3: velocity from the phase derivative ---
+        f0 = 0.5 * (self.f_start + self.f_stop)
+        lam = C / f0
+        dt = self.sweep_period_s
+
+        if n_sweeps >= 2:
+            dphidt = np.gradient(theta, dt)
+        else:
+            dphidt = np.zeros_like(theta)
+        velocity = -(lam / (4.0 * np.pi)) * dphidt
+
+        # Smooth the derivative noise. Clamp the window to the data length so a
+        # short slow-time axis does not over-smooth or error out.
+        smooth_size = min(5, max(1, n_sweeps))
+        velocity = uniform_filter1d(velocity, size=smooth_size)
+        mean_velocity_ms = float(np.mean(velocity))
+
+        # --- Step 4: micro-Doppler STFT of the complex bin signal ---
+        nperseg = max(1, min(16, n_sweeps // 2))
+        if nperseg >= 2 and n_sweeps > nperseg:
+            hop = max(1, nperseg // 4)
+            win = np.hanning(nperseg)
+            starts = list(range(0, n_sweeps - nperseg + 1, hop))
+            cols = [
+                np.fft.fftshift(np.fft.fft(bin_signal[i:i + nperseg] * win))
+                for i in starts
+            ]
+            spec = np.abs(np.array(cols).T)  # (nperseg, n_frames)
+
+            freqs = np.fft.fftshift(np.fft.fftfreq(nperseg, dt))
+            # Doppler frequency -> radial velocity, reordered ascending.
+            v_axis = (-lam * freqs / 2.0)[::-1]
+            spec = spec[::-1, :]
+            t_axis = (np.array(starts) + nperseg / 2.0) * dt
+        else:
+            # Too few sweeps for a meaningful STFT; return empty arrays.
+            spec = np.empty((0, 0))
+            v_axis = np.empty(0)
+            t_axis = np.empty(0)
+
+        moving = bool(abs(mean_velocity_ms) > self.doppler_motion_threshold_ms)
+
+        return {
+            "velocity_ms": velocity,
+            "mean_velocity_ms": mean_velocity_ms,
+            "doppler_spectrogram": spec,
+            "doppler_v_axis": v_axis,
+            "doppler_t_axis": t_axis,
+            "target_range_m": target_range_m,
+            "moving": moving,
+        }
+
+    # ------------------------------------------------------------------ #
     # Diagnostic — frequency-domain spectrum
     # ------------------------------------------------------------------ #
 
@@ -295,7 +417,9 @@ class RadarPipeline:
     # Stage 5 — full pipeline
     # ------------------------------------------------------------------ #
 
-    def run(self, S_raw: np.ndarray, S_ref: np.ndarray) -> dict:
+    def run(
+        self, S_raw: np.ndarray, S_ref: np.ndarray, doppler: bool = False
+    ) -> dict:
         """
         Run the full chain and return the CFAR detection result.
 
@@ -305,16 +429,25 @@ class RadarPipeline:
         Args:
             S_raw: Measurement-path sweep stack, shape (n_sweeps, n_steps).
             S_ref: Reference-path sweep stack, same shape.
+            doppler: When True, also run doppler_process() on the same range
+                profiles and merge its velocity / micro-Doppler keys into the
+                returned dict.
 
         Returns:
-            The detection dict from cfar_detect().
+            The detection dict from cfar_detect(), optionally extended with the
+            doppler_process() keys when `doppler` is True.
         """
         S_corrected = self.phase_correction(S_raw, S_ref)
         S_clean = self.background_subtraction(S_corrected)
         h_matrix, range_axis = self.range_profile(S_clean)
-        return self.cfar_detect(h_matrix, range_axis)
+        result = self.cfar_detect(h_matrix, range_axis)
+        if doppler:
+            result.update(self.doppler_process(h_matrix, range_axis))
+        return result
 
-    def run_no_bg(self, S_raw: np.ndarray, S_ref: np.ndarray) -> dict:
+    def run_no_bg(
+        self, S_raw: np.ndarray, S_ref: np.ndarray, doppler: bool = False
+    ) -> dict:
         """
         Run the chain without background subtraction.
 
@@ -326,10 +459,17 @@ class RadarPipeline:
         Args:
             S_raw: Measurement-path sweep stack, shape (n_sweeps, n_steps).
             S_ref: Reference-path sweep stack, same shape.
+            doppler: When True, also run doppler_process() on the same range
+                profiles and merge its velocity / micro-Doppler keys into the
+                returned dict.
 
         Returns:
-            The detection dict from cfar_detect().
+            The detection dict from cfar_detect(), optionally extended with the
+            doppler_process() keys when `doppler` is True.
         """
         S_corrected = self.phase_correction(S_raw, S_ref)
         h_matrix, range_axis = self.range_profile(S_corrected)
-        return self.cfar_detect(h_matrix, range_axis)
+        result = self.cfar_detect(h_matrix, range_axis)
+        if doppler:
+            result.update(self.doppler_process(h_matrix, range_axis))
+        return result

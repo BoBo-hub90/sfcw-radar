@@ -89,6 +89,12 @@ def parse_args() -> argparse.Namespace:
         help="Skip background subtraction (phase_correction -> range_profile -> "
              "cfar_detect) when there is no stable clutter background to estimate.",
     )
+    parser.add_argument(
+        "--doppler",
+        action="store_true",
+        help="Also estimate radial velocity / micro-Doppler at the target bin "
+             "and print mean velocity and a moving/static flag.",
+    )
     return parser.parse_args()
 
 
@@ -230,15 +236,21 @@ def main() -> None:
             S_raw = np.asarray(raw_buffer)
             S_ref = np.asarray(ref_buffer)
             if args.no_bg:
-                result = pipeline.run_no_bg(S_raw, S_ref)
+                result = pipeline.run_no_bg(S_raw, S_ref, doppler=args.doppler)
             else:
-                result = pipeline.run(S_raw, S_ref)
+                result = pipeline.run(S_raw, S_ref, doppler=args.doppler)
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(
+            line = (
                 f"[{timestamp}] detected={str(result['detected']):5s}  "
                 f"target_range_m={result['target_range_m']:.3f}"
             )
+            if args.doppler:
+                line += (
+                    f"  mean_velocity_ms={result['mean_velocity_ms']:+.3f}  "
+                    f"moving={str(result['moving']):5s}"
+                )
+            print(line)
 
             # Frequency spectrum is needed by both --debug and --plot.
             if args.debug or args.plot:
